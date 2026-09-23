@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="viewport-fit=cover, width=device-width, initial-scale=1.0">
+  <title>PWA Test</title>
+
+  <meta name="theme-color" content="#ff00ff">
+  <link rel="manifest" href="manifest.json">
+
+  <!-- Matching the proven khmyznikov/pwa-install config: apple-touch-fullscreen +
+       clean viewport (no maximum-scale/user-scalable). -->
+  <meta name="apple-touch-fullscreen" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="PWATest">
+  <link rel="apple-touch-icon" href="icon-192.png">
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    /* RED canvas again, to detect any uncovered gap. Following the proven
+       khmyznikov/pwa-install technique: extend html past 100vh by the bottom inset and
+       pin its background. */
+    html {
+      height: 100%;
+      height: calc(100vh + env(safe-area-inset-bottom));
+      background: #ff0000;
+      background-attachment: fixed;
+      overflow: hidden;
+    }
+    body { height: 100%; margin: 0; background: #ff0000; overflow: hidden; }
+
+    /* The app shell, pinned with position:fixed + inset:0. GREEN fill = the area a fixed
+       shell actually covers; any RED below it = home-indicator strip it fails to reach. */
+    #app {
+      position: fixed;
+      inset: 0;
+      background: #00aa00;
+      color: #fff;
+      font: 13px/1.5 -apple-system, monospace;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* YELLOW band = top safe-area inset (status bar / Dynamic Island region). */
+    #top-inset {
+      height: env(safe-area-inset-top, 0px);
+      background: #ffcc00;
+      flex: none;
+    }
+
+    /* BLUE = the main content between the insets. */
+    #content {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
+      background: #0066ff;
+      padding: 16px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    /* MAGENTA band = bottom safe-area inset (home indicator region). This is the strip
+       that has been showing up black/green in the real app. */
+    #bottom-inset {
+      height: env(safe-area-inset-bottom, 0px);
+      background: #ff00ff;
+      flex: none;
+    }
+
+    h1 { font-size: 18px; margin-bottom: 10px; }
+    .ok { color: #aaffaa; }
+    .bad { color: #ffaaaa; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="top-inset"></div>
+    <div id="content"><h1>PWA fullscreen test</h1><span id="out">measuring…</span></div>
+    <div id="bottom-inset"></div>
+  </div>
+
+  <script>
+    // Register a service worker (installability). iOS doesn't strictly need it for
+    // Add-to-Home-Screen, but it makes this a "real" PWA for Android/Chrome too.
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').catch(function () {});
+    }
+
+    // Measure the pixel height of an arbitrary CSS length by applying it to a probe.
+    function measure(cssHeight, position) {
+      var d = document.createElement('div');
+      d.style.cssText = 'position:' + (position || 'fixed') + ';left:0;top:0;width:0;height:' + cssHeight + ';';
+      document.body.appendChild(d);
+      var h = d.getBoundingClientRect().height;
+      d.remove();
+      return Math.round(h);
+    }
+
+    function render() {
+      var standalone = window.navigator.standalone === true
+        || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+      var app = document.getElementById('app').getBoundingClientRect();
+      var lines = [
+        'standalone = ' + standalone + '   screen.height = ' + screen.height,
+        'innerHeight = ' + window.innerHeight
+          + '   visualVP = ' + (window.visualViewport ? Math.round(window.visualViewport.height) : 'n/a'),
+        '',
+        '#app(fixed inset:0) bottom = ' + Math.round(app.bottom) + ' height = ' + Math.round(app.height),
+        '',
+        'WHICH UNIT = screen.height (' + screen.height + ')?',
+        '  100vh  = ' + measure('100vh'),
+        '  100dvh = ' + measure('100dvh'),
+        '  100svh = ' + measure('100svh'),
+        '  100lvh = ' + measure('100lvh'),
+        '  fixed inset:0   = ' + measure('100%', 'fixed'),
+        '  abs   inset:0   = ' + measureInset(),
+        '',
+        'safe-area-inset-top    = ' + measure('env(safe-area-inset-top,0px)') + 'px',
+        'safe-area-inset-bottom = ' + measure('env(safe-area-inset-bottom,0px)') + 'px',
+        '',
+        'GOAL: a unit/technique whose value = ' + screen.height,
+      ];
+      document.getElementById('out').textContent = lines.join('\n');
+    }
+
+    // Height of an absolutely-positioned inset:0 element (its parent is the full-screen body).
+    function measureInset() {
+      var d = document.createElement('div');
+      d.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;';
+      document.body.appendChild(d);
+      var h = d.getBoundingClientRect().height;
+      d.remove();
+      return Math.round(h);
+    }
+
+    render();
+    window.addEventListener('resize', render);
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', render);
+  </script>
+</body>
+</html>

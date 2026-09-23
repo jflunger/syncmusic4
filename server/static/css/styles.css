@@ -1,0 +1,90 @@
+/*
+ * SyncMusic4 - Global styling
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+/*
+ * Native-app feel: stop long-press from selecting text / popping the iOS
+ * callout menu on buttons, song rows, artwork, labels, etc. user-select and
+ * -webkit-touch-callout are inherited and cross shadow-DOM boundaries, so this
+ * default reaches into all our Web Components. Real text fields opt back in
+ * below (browsers also keep editable elements selectable regardless).
+ */
+body {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+input,
+textarea,
+[contenteditable]:not([contenteditable="false"]) {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+body, html {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #000;
+  background-attachment: fixed;
+  color: #fff;
+  overflow-x: hidden;
+  touch-action: manipulation; /* disable double-tap & pinch zoom */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* App container simulates mobile app experience */
+body > music-app {
+  width: 375px;
+  height: 667px;
+  border-radius: 20px;
+  box-shadow: 0 0 50px rgba(0,0,0,0.5);
+  overflow: hidden;
+  background: #000;
+}
+
+/*
+ * On actual phones (and when installed as a PWA), drop the desktop "phone frame"
+ * and let the app fill the entire screen. The document itself is locked (overflow:
+ * hidden) so it can never scroll or rubber-band — only the in-app scroller
+ * (.tab-content) moves, which keeps the top/bottom nav bars pinned and sells the
+ * native-app illusion.
+ */
+@media (max-width: 600px), (display-mode: standalone) {
+  html, body {
+    /* Reach the TRUE screen bottom in an installed iOS PWA. With viewport-fit=cover,
+       iOS still resolves 100vh/100dvh to the *safe* viewport — screen height minus the
+       home-indicator inset — so a plain 100dvh document stops short of the physical
+       bottom. Because the shell is overflow:hidden, the .tab-bar's home-indicator fill
+       strip then gets clipped and the bare page shows through as a black bar.
+       Matching the known-working fullscreen demo (khmyznikov/pwa-install), we extend
+       the document by env(safe-area-inset-bottom) so it covers the full screen. This is
+       independent of the .tab-bar's own safe-area padding (which lifts the *buttons*
+       above the indicator) — one extends the canvas to the bottom, the other keeps the
+       UI clear of it. In a plain Safari tab the inset is 0, so this is a no-op there. */
+    height: calc(100vh + env(safe-area-inset-bottom, 0px));
+    height: calc(100dvh + env(safe-area-inset-bottom, 0px));
+    overflow: hidden;
+  }
+  body {
+    position: relative;
+    width: 100%;
+    display: block;
+    overscroll-behavior: none;
+  }
+  body > music-app {
+    width: 100%;
+    height: 100%;
+    border-radius: 0;
+    box-shadow: none;
+  }
+}

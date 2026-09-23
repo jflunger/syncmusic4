@@ -1,0 +1,59 @@
+# Fully-pinned lock generated from the working server venv (pip freeze).
+# Recreate the environment with:
+#   python3 -m venv venv
+#   ./venv/bin/pip install -r requirements.txt
+# Note: yt-dlp and votify install here, but the app shells out to them by name,
+# so the venv's bin/ must be on PATH at runtime (start.sh handles this).
+
+bidict==0.23.1
+blinker==1.9.0
+certifi==2026.5.20
+cffi==2.0.0
+charset-normalizer==3.4.7
+click==8.4.1
+colorama==0.4.6
+construct==2.8.8
+curl_cffi==0.15.0
+dacite==1.9.2
+Flask==2.3.3
+Flask-Cors==4.0.0
+Flask-SocketIO==5.6.1
+h11==0.16.0
+idna==3.18
+inquirerpy==0.3.4
+itsdangerous==2.2.0
+Jinja2==3.1.6
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+mdurl==0.1.2
+mutagen==1.47.0
+pfzy==0.3.4
+pillow==12.2.0
+prompt_toolkit==3.0.52
+protobuf==6.33.6
+pybase62==1.0.0
+pycparser==3.0
+pycryptodome==3.23.0
+Pygments==2.20.0
+pymp4==1.4.0
+python-dateutil==2.9.0.post0
+python-engineio==4.13.2
+python-socketio==5.16.2
+pywidevine==1.9.0
+PyYAML==6.0.3
+redis==8.0.0
+requests==2.34.2
+rich==15.0.0
+simple-websocket==1.1.0
+six==1.17.0
+soundcloud-v2==1.7.0
+spotipy==2.26.0
+Unidecode==1.4.0
+urllib3==2.7.0
+votify @ git+https://github.com/GladistonXD/votify-fix.git@f7aa9d2cdd2edd6504d8e5d39aa8363b5d603a67
+waitress==3.0.2
+wcwidth==0.8.1
+websocket-client==1.9.0
+Werkzeug==2.3.7
+wsproto==1.3.2
+yt-dlp==2026.6.9

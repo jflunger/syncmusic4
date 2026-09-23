@@ -1,0 +1,28 @@
+# vibe commits this repo nightly. Keep secrets, build output and big files out.
+.env
+.env.*
+*.key
+*.pem
+secrets/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+dist/
+build/
+*.egg-info/
+*.log
+.DS_Store
+
+# syncmusic4: secrets, runtime data and the audio library stay out of git.
+.cache
+.python-version
+cookies*.txt
+credentials.json
+admin_key.txt
+server/secret_key.txt
+server/static/audio/
+server/static/uploads/
+server/downloads/
+*.db

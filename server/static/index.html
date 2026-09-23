@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="viewport-fit=cover, width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>SyncMusic4</title>
+    <meta name="description" content="Progressive music streaming app">
+    <meta name="theme-color" content="#000000">
+    <!-- Legacy true-fullscreen unlock: without this iOS hands the installed PWA a
+         reduced viewport with zero safe-area insets (see docs/ios-pwa-fullscreen.md). -->
+    <meta name="apple-touch-fullscreen" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+    <link rel="apple-touch-icon" href="icon-192.png">
+    <link rel="manifest" href="manifest.json">
+    <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+    <music-app></music-app>
+
+<script type="module" src="js/state/appState.js"></script>
+<script type="module" src="js/services/api.js"></script>
+<script type="module" src="js/components/MusicApp.js"></script>
+<script type="module" src="js/components/DiscoverTab.js"></script>
+<script type="module" src="js/components/PlayTab.js"></script>
+<script type="module" src="js/components/CurateTab.js"></script>
+<script type="module" src="js/components/SongItem.js"></script>
+<script type="module" src="js/components/SearchResultItem.js"></script>
+<script type="module" src="js/components/PlaylistItem.js"></script>
+
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" integrity="sha384-2huaZvOR9iDzHqslqwpR87isEmrfxqyWOF7hr7BY6KG0+hVKLoEXMPUJw3ynWuhO" crossorigin="anonymous"></script>
+    <script>console.log('🔌 Socket.IO loaded:', typeof io !== 'undefined' ? 'yes' : 'no');</script>
+    <script>
+        // Only register SW in production (skip on localhost for easier debugging)
+        if ('serviceWorker' in navigator && !/localhost|127\.0\.0\.1/.test(location.hostname)) {
+            navigator.serviceWorker.register('sw.js?v=12')
+                .then(reg => console.log('SW registered'))
+                .catch(err => console.warn('SW registration failed', err));
+        }
+    </script>
+    <script>
+        // iOS Safari/PWA ignores `user-scalable=no`, so block pinch zoom here.
+        // Double-tap-to-zoom is already disabled via `touch-action: manipulation`
+        // in styles.css — do NOT re-block it with a touchend preventDefault: that
+        // also swallows the synthetic click of any second tap within ~300ms, which
+        // dropped rapid enqueue taps (tap-tap to queue two songs / bump to front).
+        document.addEventListener('gesturestart', e => e.preventDefault(), { passive: false });
+        document.addEventListener('gesturechange', e => e.preventDefault(), { passive: false });
+        document.addEventListener('gestureend', e => e.preventDefault(), { passive: false });
+        document.addEventListener('touchmove', e => {
+            if (e.touches.length > 1) e.preventDefault();
+        }, { passive: false });
+        document.addEventListener('wheel', e => {
+            if (e.ctrlKey) e.preventDefault();
+        }, { passive: false });
+    </script>
+</body>
+</html>
