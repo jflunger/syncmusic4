@@ -657,7 +657,7 @@ class PlaybackController {
   async reportListen(songId, seconds) {
     const counted = await logListen(songId, seconds);
     if (!counted) return;
-    appState.set('evergreens', await fetchEvergreens(100));
+    appState.set('evergreens', await fetchEvergreens());
   }
 
   // ---------------------------------------------------------------------------

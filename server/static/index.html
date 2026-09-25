@@ -35,7 +35,7 @@
     <script>
         // Only register SW in production (skip on localhost for easier debugging)
         if ('serviceWorker' in navigator && !/localhost|127\.0\.0\.1/.test(location.hostname)) {
-            navigator.serviceWorker.register('sw.js?v=12')
+            navigator.serviceWorker.register('sw.js?v=15')
                 .then(reg => console.log('SW registered'))
                 .catch(err => console.warn('SW registration failed', err));
         }

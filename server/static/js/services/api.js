@@ -686,10 +686,10 @@ async function logListen(songId, seconds) {
 
 /**
  * Fetch the user's evergreens: songs ranked over their last 1000 listens.
- * @param {number} [limit=100] - How many tracks to return
+ * @param {number} [limit=10] - How many tracks to return (the Tracks subtab shows this many)
  * @returns {Promise<Array>} Song objects, best first, each with `score` and `listens`
  */
-async function fetchEvergreens(limit = 100) {
+async function fetchEvergreens(limit = 10) {
   try {
     const response = await fetch(`/api/evergreens?limit=${limit}`);
     if (!response.ok) {

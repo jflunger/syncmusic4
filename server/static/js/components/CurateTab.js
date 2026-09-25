@@ -11,8 +11,11 @@ import { fetchSongs, fetchPlaylists, fetchEvergreens } from '../services/api.js'
 import queueManager from '../services/QueueManager.js';
 import './PlaylistSettings.js';
 
-// How many evergreens the Tracks subtab shows when nothing is searched.
-const EVERGREEN_LIMIT = 100;
+// How many tiles "the grid" above the evergreens shows (a 5x5 square).
+const GRID_SIZE = 25;
+// Long-press on a grid tile removes it from the queue; same timing/slop as <song-item>.
+const GRID_LONG_PRESS_MS = 500;
+const GRID_LONG_PRESS_SLOP = 15;
 
 class CurateTab extends HTMLElement {
   constructor() {
@@ -22,6 +25,8 @@ class CurateTab extends HTMLElement {
     this.playlists = [];
     this.evergreens = []; // Top tracks from the user's listen history, shown when not searching
     this.evergreensPending = false; // A re-rank arrived while the user was reading the list
+    this.gridSongs = []; // Random sample of library tracks shown as cover tiles; kept until redrawn
+    this.gridPress = null; // In-flight long-press on a grid tile: { tile, x, y, timer, fired }
     this.activeSubtab = 'tracks'; // 'tracks', 'playlists', or 'working'
     this.searchQuery = '';      // lowercased, for matching
     this.searchQueryRaw = '';   // as typed, for display and the Discover hand-off
@@ -35,6 +40,12 @@ class CurateTab extends HTMLElement {
     this.loadPlaylists();
     this.loadEvergreens();
     this.attachEvents();
+    this.attachGridPress();
+    // Grid tiles carry the same queue/now-playing badge as track rows; patch them in
+    // place so a queue change doesn't rebuild (and re-load) all 25 covers.
+    this.unsubscribeQueue = appState.subscribe((key) => {
+      if (key === 'queue' || key === 'currentSong') this.syncGridIndicators();
+    });
   }
 
   /**
@@ -106,7 +117,7 @@ class CurateTab extends HTMLElement {
     });
     this.evergreens = appState.get('evergreens') || [];
     this.renderContent();
-    appState.set('evergreens', await fetchEvergreens(EVERGREEN_LIMIT));
+    appState.set('evergreens', await fetchEvergreens());
   }
 
   /**
@@ -135,6 +146,31 @@ class CurateTab extends HTMLElement {
       // Hand the current query over to the Discover tab to search online
       if (event.target.closest('.search-online-btn')) {
         this.searchOnline();
+        return;
+      }
+
+      // The grid: redraw the sample, or enqueue a tapped tile like any other track
+      if (event.target.closest('.grid-redraw')) {
+        this.drawGrid();
+        this.renderContent();
+        return;
+      }
+      const tile = event.target.closest('.grid-tile');
+      if (tile) {
+        // A long-press already handled this gesture; swallow its trailing click.
+        if (tile.dataset.pressed) {
+          delete tile.dataset.pressed;
+          return;
+        }
+        const song = this.gridSongs.find(s => String(s.id) === tile.dataset.songId);
+        if (!song) return;
+        // Like tapping a track row's spinning disc: the playing tile toggles play/pause.
+        const current = appState.get('currentSong');
+        if (current && String(current.id) === String(song.id)) {
+          this.dispatchEvent(new CustomEvent('toggle-play-pause', { bubbles: true, composed: true }));
+          return;
+        }
+        this.dispatchEvent(new CustomEvent('enqueue-song', { detail: { song }, bubbles: true }));
         return;
       }
 
@@ -296,6 +332,70 @@ class CurateTab extends HTMLElement {
           color: #aaa;
         }
         .stats { font-size: 14px; color: #aaa; margin-top: 8px; }
+        .grid-section { margin-bottom: 20px; }
+        .grid-section[hidden] { display: none; }
+        .grid-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          margin-bottom: 8px;
+          font-size: 14px;
+          color: #aaa;
+        }
+        .grid-redraw {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          padding: 4px 10px;
+          background: #2a2a2a;
+          border: 1px solid #444;
+          border-radius: 8px;
+          color: #ddd;
+          font-size: 13px;
+          font-family: inherit;
+          cursor: pointer;
+        }
+        .grid-redraw svg { width: 14px; height: 14px; fill: currentColor; }
+        .grid-redraw:active { transform: scale(0.95); }
+        .grid {
+          display: grid;
+          grid-template-columns: repeat(5, 1fr);
+          gap: 4px;
+        }
+        .grid-tile {
+          position: relative;
+          aspect-ratio: 1;
+          padding: 0;
+          border: none;
+          border-radius: 4px;
+          overflow: hidden;
+          background: #2a2a2a;
+          cursor: pointer;
+          -webkit-touch-callout: none;
+          -webkit-user-select: none;
+          user-select: none;
+        }
+        .grid-tile img { width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none; }
+        /* Queue badge: the track row's wedge, as a centred circle in the same colours. */
+        .grid-badge {
+          position: absolute;
+          top: 50%;
+          left: 50%;
+          width: 28px;
+          height: 28px;
+          transform: translate(-50%, -50%);
+          border-radius: 50%;
+          display: none;
+          align-items: center;
+          justify-content: center;
+          font-size: 13px;
+          font-weight: 700;
+          color: #fff;
+          pointer-events: none;
+        }
+        .grid-badge.playing { display: flex; background: #1db954; }
+        .grid-badge.queued { display: flex; background: #282828; }
+        .grid-tile:active { transform: scale(0.95); }
         /* Hand-off to the Discover tab, pinned under the last search result. The
            gradient edge echoes the tab navigator and the subtab separator. */
         .search-online-btn {
@@ -445,13 +545,164 @@ class CurateTab extends HTMLElement {
           <input type="text" class="search-input" placeholder="Search tracks..."
                  value="${this.escapeHtml(this.searchQueryRaw)}">
         </div>
+        <div class="grid-section"></div>
         <div class="stats"></div>
         <div class="song-list"></div>
       `;
     }
 
-    if (this.searchQuery) this.renderTrackSearchResults(container);
-    else this.renderEvergreenList(container);
+    const gridEl = container.querySelector('.grid-section');
+    gridEl.hidden = !!this.searchQuery;
+    if (this.searchQuery) {
+      this.renderTrackSearchResults(container);
+    } else {
+      this.renderGrid(gridEl);
+      this.renderEvergreenList(container);
+    }
+  }
+
+  /**
+   * Pick a fresh random sample of GRID_SIZE playable library tracks. Tracks with
+   * cover art come first, since the grid shows nothing but covers; coverless ones
+   * only fill in when the library is short on art.
+   */
+  drawGrid() {
+    const playable = (this.songs || []).filter(song => song.url);
+    const shuffled = this.shuffle(playable);
+    const withCover = shuffled.filter(song => song.cover);
+    const withoutCover = shuffled.filter(song => !song.cover);
+    this.gridSongs = withCover.concat(withoutCover).slice(0, GRID_SIZE);
+  }
+
+  /**
+   * Fisher-Yates shuffle into a new array.
+   * @param {Array} items
+   * @returns {Array} The items in random order
+   */
+  shuffle(items) {
+    const out = items.slice();
+    for (let i = out.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [out[i], out[j]] = [out[j], out[i]];
+    }
+    return out;
+  }
+
+  /**
+   * The grid: a 5x5 tiling of cover art; taps follow the usual enqueue → front → play cycle. The sample is drawn once the
+   * library arrives and stays put across re-renders until the redraw button is hit.
+   * @param {HTMLElement} gridEl - The .grid-section container
+   */
+  renderGrid(gridEl) {
+    if (this.gridSongs.length === 0) this.drawGrid();
+    if (this.gridSongs.length === 0) {
+      gridEl.innerHTML = '';
+      return;
+    }
+
+    // Library/playlist updates re-render the tab often; only rebuild the tiles when the
+    // sample actually changed, so the covers don't flash.
+    const key = this.gridSongs.map(song => song.id).join(',');
+    if (gridEl.dataset.key === key) return;
+    gridEl.dataset.key = key;
+
+    const tiles = this.gridSongs.map(song => `
+      <button class="grid-tile" type="button" data-song-id="${song.id}"
+              aria-label="${this.escapeHtml(`${song.title || ''} – ${song.artist || ''}`)}">
+        ${song.cover ? `<img src="${this.escapeHtml(song.cover)}" alt="" loading="lazy" draggable="false">` : ''}
+        <span class="grid-badge"></span>
+      </button>`).join('');
+
+    gridEl.innerHTML = `
+      <div class="grid-header">
+        <span>The grid</span>
+        <button class="grid-redraw" type="button" aria-label="Redraw the grid">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+          Redraw
+        </button>
+      </div>
+      <div class="grid">${tiles}</div>
+    `;
+    this.syncGridIndicators();
+  }
+
+  /**
+   * Update every grid tile's centre badge from the queue and current song — the same
+   * states as a track row's wedge: green play icon for the current track, grey queue
+   * position for a queued one, hidden otherwise.
+   */
+  syncGridIndicators() {
+    const tiles = this.shadowRoot.querySelectorAll('.grid-tile');
+    if (!tiles.length) return;
+    const queue = appState.get('queue') || [];
+    const current = appState.get('currentSong');
+
+    tiles.forEach(tile => {
+      const id = tile.dataset.songId;
+      const badge = tile.querySelector('.grid-badge');
+      const qIndex = queue.findIndex(s => String(s.id) === id);
+      if (current && String(current.id) === id) {
+        badge.className = 'grid-badge playing';
+        badge.innerHTML = '<svg viewBox="0 0 24 24" width="15" height="15" fill="#fff"><path d="M8 5v14l11-7z"/></svg>';
+      } else if (qIndex >= 0) {
+        badge.className = 'grid-badge queued';
+        badge.textContent = String(qIndex + 1);
+      } else {
+        badge.className = 'grid-badge';
+        badge.textContent = '';
+      }
+    });
+  }
+
+  /**
+   * Long-press a grid tile → remove its track from the queue (the grid has no wedge to
+   * tap, so the hold does that job). Pointer events cover touch and mouse alike; a move
+   * past the slop or a pointercancel (the browser taking over to scroll) aborts it.
+   */
+  attachGridPress() {
+    const cancel = () => {
+      if (this.gridPress) clearTimeout(this.gridPress.timer);
+      this.gridPress = null;
+    };
+
+    this.shadowRoot.addEventListener('pointerdown', (event) => {
+      const tile = event.target.closest('.grid-tile');
+      if (!tile) return;
+      cancel();
+      delete tile.dataset.pressed;
+      this.gridPress = {
+        tile,
+        x: event.clientX,
+        y: event.clientY,
+        timer: setTimeout(() => this.onGridLongPress(tile), GRID_LONG_PRESS_MS)
+      };
+    });
+    this.shadowRoot.addEventListener('pointermove', (event) => {
+      const press = this.gridPress;
+      if (!press) return;
+      if (Math.hypot(event.clientX - press.x, event.clientY - press.y) > GRID_LONG_PRESS_SLOP) cancel();
+    });
+    this.shadowRoot.addEventListener('pointerup', cancel);
+    this.shadowRoot.addEventListener('pointercancel', cancel);
+    // Keep the OS image/long-press menu from popping up over the grid.
+    this.shadowRoot.addEventListener('contextmenu', (event) => {
+      if (event.target.closest('.grid-tile')) event.preventDefault();
+    });
+  }
+
+  /**
+   * A tile was held long enough: drop its track from the queue if it's queued.
+   * @param {HTMLElement} tile
+   */
+  onGridLongPress(tile) {
+    this.gridPress = null;
+    tile.dataset.pressed = '1'; // swallow the click that follows the release
+    const songId = tile.dataset.songId;
+    const index = (appState.get('queue') || []).findIndex(s => String(s.id) === songId);
+    if (index < 0) return;
+    this.dispatchEvent(new CustomEvent('remove-from-queue', {
+      detail: { songId, index }, bubbles: true, composed: true
+    }));
   }
 
   /**
