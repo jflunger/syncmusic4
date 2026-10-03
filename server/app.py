@@ -345,6 +345,11 @@ migrate_add_playlist_icon()
 migrate_add_playlist_owner()
 migrate_queue_per_account()
 
+import related_tracks
+_conn = get_db_connection()
+related_tracks.migrate_related_tables(_conn)
+_conn.close()
+
 # Initialize SocketIO
 # async_mode='threading' lets Socket.IO run under a plain WSGI server (waitress)
 # in production. allow_upgrades=False keeps clients on long-polling: waitress
@@ -374,6 +379,10 @@ fallback_manager = DownCloudManager(
     downloads_path=os.path.join(app.root_path, 'downloads', 'downcloud'),
 )
 manager.fallback_manager = fallback_manager
+
+# Related-track lookups: own queue + worker per platform (YouTube, SoundCloud),
+# resting 30s between jobs so neither platform gets hammered.
+related_manager = related_tracks.RelatedManager(DB_PATH, socketio=socketio)
 
 AUDIO_DIR = os.path.join(app.root_path, 'static', 'audio')
 
@@ -643,6 +652,8 @@ def delete_song(song_id):
         file_path = song['file_path']
 
         cursor.execute('DELETE FROM songs WHERE id = ?', (song_id,))
+        cursor.execute('DELETE FROM related_tracks WHERE song_id = ?', (song_id,))
+        cursor.execute('DELETE FROM related_fetches WHERE song_id = ?', (song_id,))
         conn.commit()
 
         # Remove audio file from disk if it exists
@@ -1780,6 +1791,60 @@ def search_songs():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/songs/<int:song_id>/related')
+def get_song_related(song_id):
+    """
+    Stored tracks related to a library song.
+
+    Queues a background lookup when the song has no stored results or they
+    are older than 3 months; stale results are still returned meanwhile.
+    The lookup finishing is announced with a 'related_updated' WebSocket event.
+
+    Returns:
+        JSON: { status: 'ready'|'queued'|'fetching'|'error', fetched_at,
+                queue_position, error, results: [... + library_song_id] }
+    """
+    conn = get_db_connection()
+    try:
+        song = conn.execute('SELECT source, download_link FROM songs WHERE id = ?', (song_id,)).fetchone()
+        if not song:
+            return jsonify({'error': 'Song not found'}), 404
+        source = (song['source'] or '').lower()
+        if source not in related_tracks.SOURCES:
+            return jsonify({'error': 'Related tracks are only supported for YouTube and SoundCloud'}), 400
+
+        fetch, results = related_tracks.load_related(conn, song_id)
+        if related_tracks.is_stale(fetch):
+            related_manager.enqueue(song_id, source, song['download_link'])
+
+        # Mark results already in the library (matched on their source URL).
+        urls = [r['url'] for r in results]
+        library = {}
+        if urls:
+            rows = conn.execute(
+                f"SELECT id, download_link FROM songs WHERE download_link IN ({','.join('?' * len(urls))})",
+                urls
+            ).fetchall()
+            library = {row['download_link']: row['id'] for row in rows}
+    finally:
+        conn.close()
+
+    job = related_manager.job_status(song_id, source)
+    if job:
+        status = job['state']
+    elif fetch and fetch['last_error'] and (not fetch['fetched_at'] or fetch['attempted_at'] > fetch['fetched_at']):
+        status = 'error'
+    else:
+        status = 'ready'
+
+    return jsonify({
+        'status': status,
+        'fetched_at': fetch['fetched_at'] if fetch else None,
+        'queue_position': (job or {}).get('position'),
+        'error': fetch['last_error'] if fetch and status == 'error' else None,
+        'results': [{**r, 'library_song_id': library.get(r['url'])} for r in results],
+    })
+
 @app.route('/api/download', methods=['POST'])
 def download_track():
     """
@@ -1999,10 +2064,12 @@ def clear_history():
 LISTEN_THRESHOLD_SECONDS = 30
 
 # Evergreens score only the most recent EVERGREEN_WINDOW listens: the newest one
-# is worth EVERGREEN_WINDOW points, the one before it one point less, and so on
-# down to 1. A song's score is the sum of the points of its listens in that
-# window, so both "played a lot" and "played recently" push a track up.
+# is worth EVERGREEN_PEAK points, the one before it one point less, and so on
+# down to 1; every older listen in the window is worth a flat 1 point. A song's
+# score is the sum of the points of its listens in that window, so recent plays
+# give a strong boost while long-run play counts still add up.
 EVERGREEN_WINDOW = 1000
+EVERGREEN_PEAK = 100
 
 # Human-readable append-only mirror of the listens table (JSON lines), handy for
 # grepping playback history without opening the database.
@@ -2110,7 +2177,7 @@ def get_evergreens():
         counts = {}
         for index, row in enumerate(recent):
             song_id = row['song_id']
-            scores[song_id] = scores.get(song_id, 0) + (EVERGREEN_WINDOW - index)
+            scores[song_id] = scores.get(song_id, 0) + max(EVERGREEN_PEAK - index, 1)
             counts[song_id] = counts.get(song_id, 0) + 1
 
         if not scores:
@@ -2151,12 +2218,12 @@ def get_evergreens():
 
 @app.route('/api/playback-state', methods=['GET'])
 def get_playback_state():
-    """Return the current user's resume point: the loaded song (or null) and the
-    playback position in seconds."""
+    """Return the current user's resume point: the loaded song (or null), the
+    playback position in seconds, and when it was saved (UTC, 'YYYY-MM-DD HH:MM:SS')."""
     conn = get_db_connection()
     try:
         row = conn.execute(f'''
-            SELECT ps.position AS resume_position, {_SONG_SELECT}
+            SELECT ps.position AS resume_position, ps.updated_at AS resume_updated_at, {_SONG_SELECT}
             FROM playback_state ps
             JOIN songs s ON ps.song_id = s.id
             WHERE ps.owner = ?
@@ -2166,6 +2233,7 @@ def get_playback_state():
         return jsonify({
             'song': _song_row_to_client(row),
             'position': row['resume_position'] or 0,
+            'updated_at': row['resume_updated_at'],
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -2280,6 +2348,7 @@ def start_download_manager():
     if not manager_started:
         manager.start()
         fallback_manager.start()
+        related_manager.start()
 
         # Start event processing thread (drains both managers' event queues)
         def process_events_loop():
@@ -2288,6 +2357,7 @@ def start_download_manager():
                 try:
                     manager.process_events()
                     fallback_manager.process_events()
+                    related_manager.process_events()
                     time.sleep(0.1)  # Process events every 100ms
                 except Exception as e:
                     print(f"Error processing events: {e}")
@@ -2302,6 +2372,7 @@ def start_download_manager():
 import atexit
 atexit.register(manager.stop)
 atexit.register(fallback_manager.stop)
+atexit.register(related_manager.stop)
 
 if __name__ == '__main__':
     host = os.environ.get('HOST', '0.0.0.0')

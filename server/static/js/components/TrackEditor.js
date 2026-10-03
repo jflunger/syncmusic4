@@ -2,7 +2,8 @@
  * Track editor modal - Edit song name, artist, start and end times.
  * Usage: <track-editor song="..."></track-editor>
  * Emits: 'close' when dismissed, 'saved' when save succeeds, 'deleted' when deleted,
- *        'redownload' when a re-download is queued (detail: { songId })
+ *        'redownload' when a re-download is queued (detail: { songId }),
+ *        'show-related' when "Show related" is tapped (detail: { song })
  */
 
 import { updateSong, deleteSong, redownloadSong } from '../services/api.js';
@@ -138,6 +139,7 @@ class TrackEditor extends HTMLElement {
   render() {
     const song = this.song || {};
     const canSave = song.id && (typeof song.id === 'number' || /^\d+$/.test(String(song.id)));
+    const canShowRelated = canSave && ['youtube', 'soundcloud'].includes((song.source || '').toLowerCase());
     const title = song.title ?? '';
     const artist = song.artist ?? '';
 
@@ -489,6 +491,7 @@ class TrackEditor extends HTMLElement {
         <div class="field">
           <button class="redownload-btn" id="redownload-btn" ${!canSave ? 'disabled' : ''}>🔄 Re-download file</button>
           <p class="redownload-hint">Re-fetches the audio from the original source if the wrong file got attached.</p>
+          ${canShowRelated ? '<button class="redownload-btn" id="related-btn" style="margin-top: 12px;">🔗 Show related</button>' : ''}
         </div>
 
         <div class="actions">
@@ -537,6 +540,11 @@ class TrackEditor extends HTMLElement {
     const redownloadBtn = this.shadowRoot.getElementById('redownload-btn');
     if (redownloadBtn) {
       redownloadBtn.addEventListener('click', () => this.redownload());
+    }
+
+    const relatedBtn = this.shadowRoot.getElementById('related-btn');
+    if (relatedBtn) {
+      relatedBtn.addEventListener('click', () => this.showRelated());
     }
 
     // ± adjustment buttons (millisecond nudges)
@@ -774,6 +782,15 @@ class TrackEditor extends HTMLElement {
         btn.textContent = '🔄 Re-download file';
       }
     }
+  }
+
+  /** Hand the song to the app to list related tracks in the Discover tab. */
+  showRelated() {
+    this.dispatchEvent(new CustomEvent('show-related', {
+      detail: { song: this.song },
+      bubbles: true
+    }));
+    this.close();
   }
 
   /** Play, or stop, a short snippet at the chosen start or end cutoff. */

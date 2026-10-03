@@ -266,17 +266,20 @@ async function savePlaybackState(songId, position) {
 
 /**
  * Load the resume point from the server.
- * @returns {Promise<{song: Object|null, position: number}>}
+ * @returns {Promise<{song: Object|null, position: number, updatedAt: number}>} updatedAt is
+ *   epoch ms (0 when unknown).
  */
 async function loadPlaybackState() {
   try {
     const response = await fetch('/api/playback-state');
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
-    return { song: data.song || null, position: data.position || 0 };
+    // updated_at is SQLite CURRENT_TIMESTAMP: UTC without a zone marker.
+    const updatedAt = data.updated_at ? Date.parse(data.updated_at.replace(' ', 'T') + 'Z') || 0 : 0;
+    return { song: data.song || null, position: data.position || 0, updatedAt };
   } catch (error) {
     console.error('Error loading playback state:', error);
-    return { song: null, position: 0 };
+    return { song: null, position: 0, updatedAt: 0 };
   }
 }
 
@@ -397,6 +400,23 @@ async function redownloadSong(songId) {
     console.error('Error re-downloading song:', error);
     throw error;
   }
+}
+
+/**
+ * Stored tracks related to a library song. Queues a background lookup on the
+ * server when none are stored or they are over 3 months old; a
+ * 'related_updated' socket event follows when it finishes.
+ * @param {number} songId
+ * @returns {Promise<Object>} { status: 'ready'|'queued'|'fetching'|'error', fetched_at, queue_position, error,
+ *   results: [{ title, artist, url, cover, duration, source, rank, metrics, library_song_id }] }
+ */
+async function fetchSongRelated(songId) {
+  const response = await fetch(`/api/songs/${songId}/related`);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || `HTTP error! status: ${response.status}`);
+  }
+  return data;
 }
 
 /**
@@ -707,7 +727,7 @@ export {
   fetchSongs, createPlaylist, fetchPlaylists, downloadFromSpotify, searchSongs,
   downloadTrack, saveQueue, loadQueue, saveHistory, loadHistory, clearHistory,
   savePlaybackState, loadPlaybackState, addSongToPlaylist, removeSongFromPlaylist, updateSong, deleteSong,
-  redownloadSong,
+  redownloadSong, fetchSongRelated,
   updatePlaylist, deletePlaylist, uploadPlaylistIcon, usePlaylistFeederIcon, removePlaylistIcon,
   fetchFeeders, addFeeder, removeFeeder, triggerSync, fetchSyncStatus,
   fetchPlayFeeders, addPlayFeeder, removePlayFeeder,

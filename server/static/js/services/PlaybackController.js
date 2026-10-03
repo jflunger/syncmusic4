@@ -27,6 +27,7 @@
 import appState from '../state/appState.js';
 import queueManager from './QueueManager.js';
 import nextTrack from './NextTrack.js';
+import ownership from './PlayerOwnership.js';
 import { savePlaybackState as apiSavePlaybackState, loadPlaybackState, logListen, fetchEvergreens } from './api.js';
 
 // A play counts as a "listen" (and is logged to the backend) once this much of the track has
@@ -67,6 +68,10 @@ class PlaybackController {
     this.attachAudioListeners(this.audioElement);
     this.attachAudioListeners(this.preloadEl);
     this.armAudioUnlock();
+
+    // Another copy of the app on this device (e.g. the one iOS spun up on unlock) started
+    // playing: go silent so the two never sound over each other. See PlayerOwnership.
+    ownership.onYield(() => this.yieldPlayback());
 
     // NextTrack owns "what plays next". Teach it which songs are playable and keep the idle
     // element warmed with the resolved next track. The disk-preview UI also listens to
@@ -121,6 +126,7 @@ class PlaybackController {
   play() {
     const song = appState.get('currentSong');
     if (song) {
+      ownership.claim();
       const p = this.audioElement.play();
       if (p && typeof p.catch === 'function') p.catch(() => {});
     } else {
@@ -160,6 +166,8 @@ class PlaybackController {
       this.toggle();
       return;
     }
+
+    ownership.claim();   // starting a track makes this copy the device's one player
 
     if (recordHistory && current) {
       queueManager.addToHistory(current);
@@ -324,6 +332,9 @@ class PlaybackController {
 
     el.addEventListener('ended', () => {
       if (!isActive()) return;
+      // A copy that lost ownership (an orphaned page thawing as its track ends) must not
+      // advance — that is exactly how a second song ends up playing over the real one.
+      if (!ownership.isOwner()) { this.yieldPlayback(); return; }
       // Stay "playing" as far as the store and the OS are concerned until the next track is
       // actually rolling. next() publishes isPlaying=false itself if there is nothing to play.
       this.beginAdvance();
@@ -332,6 +343,12 @@ class PlaybackController {
 
     el.addEventListener('timeupdate', () => {
       if (!isActive()) return;
+      // First JS this page runs after being thawed while still sounding: if another copy owns
+      // playback now, stop here rather than keep playing underneath it.
+      if (!ownership.isOwner()) {
+        if (!el.paused) this.yieldPlayback();
+        return;
+      }
       const ct = el.currentTime;
       appState.set('currentTime', ct);
       this.trackListenProgress(ct);
@@ -382,8 +399,19 @@ class PlaybackController {
         nextTrack.invalidate();
       }
       // Auto-skip; small delay to avoid rapid-fire skipping on a run of bad files.
-      setTimeout(() => this.next(), 500);
+      setTimeout(() => { if (ownership.isOwner()) this.next(); }, 500);
     });
+  }
+
+  /**
+   * Another copy of the app owns playback now: go silent. Deliberately does NOT persist — the
+   * resume point belongs to the new owner, and this copy's position is stale.
+   */
+  yieldPlayback() {
+    console.warn('Another app instance took over playback; pausing this one');
+    this.endAdvance();
+    this.audioElement.pause();
+    this.preloadEl.pause();
   }
 
   // ---------------------------------------------------------------------------
@@ -572,7 +600,8 @@ class PlaybackController {
    */
   async restore() {
     if (appState.get('currentSong')) return;
-    const { song, position } = await loadPlaybackState();
+    const saved = await loadPlaybackState();
+    const { song, position } = this.pickResumePoint(saved);
     if (!song || !song.url) return;
 
     appState.set('currentSong', song);
@@ -591,17 +620,37 @@ class PlaybackController {
   }
 
   /**
-   * Persist the resume point (current song id + position). Throttled to ~once every 4s unless
-   * `force` is set (track change, pause, page hide).
+   * Choose between the server's resume point and this device's local mirror, whichever was
+   * written last. The local one wins after an iOS relaunch: the old page kept playing with its
+   * network cut off, so only localStorage saw where it really got to. The server's wins when
+   * another device played more recently.
+   * @param {{song: Object|null, position: number, updatedAt: number}} saved - server state
+   * @returns {{song: Object|null, position: number}}
+   */
+  pickResumePoint(saved) {
+    const local = ownership.loadLocalResume();
+    if (!local || !(local.at > (saved.updatedAt || 0))) return saved;
+    const song = (appState.get('songs') || []).find((s) => s.id === local.songId);
+    return song?.url ? { song, position: local.position || 0 } : saved;
+  }
+
+  /**
+   * Persist the resume point (current song id + position): mirrored to localStorage every call,
+   * sent to the server ~once every 4s unless `force` is set (track change, pause, page hide).
    * @param {boolean} [force=false]
    */
   persist(force = false) {
-    const now = Date.now();
-    if (!force && now - (this._lastStateSave || 0) < 4000) return;
-    this._lastStateSave = now;
+    // Only the device's playing copy owns the resume point; an orphaned page flushing on
+    // pagehide would otherwise roll it back to its stale position.
+    if (!ownership.isOwner()) return;
     const song = appState.get('currentSong');
     const songId = song && Number.isInteger(song.id) ? song.id : null;
     const position = this.audioElement ? (this.audioElement.currentTime || 0) : 0;
+    ownership.saveLocalResume(songId, position);   // unthrottled + offline-proof
+
+    const now = Date.now();
+    if (!force && now - (this._lastStateSave || 0) < 4000) return;
+    this._lastStateSave = now;
     apiSavePlaybackState(songId, position).catch(() => {});
   }
 

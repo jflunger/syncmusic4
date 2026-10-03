@@ -6,7 +6,7 @@
 // asset. The fetch handler is cache-first, so clients keep serving the old copy until
 // CACHE_NAME changes — forgetting this is how the iOS PWA fullscreen fix keeps "regressing"
 // even when the source files are correct. See docs/ios-pwa-fullscreen.md.
-const CACHE_NAME = 'syncmusic-v15';
+const CACHE_NAME = 'syncmusic-v29';
 const CACHE_FILES = [
   '/',
   '/index.html',
@@ -22,6 +22,13 @@ const CACHE_FILES = [
   '/js/components/PlaylistItem.js',
   '/manifest.json'
 ];
+
+// Cover art lives in its own cache so it survives CACHE_NAME bumps. Covers are immutable CDN
+// URLs (i.ytimg.com, *.sndcdn.com), so cache-first with no revalidation is safe.
+const COVER_CACHE = 'syncmusic-covers-v1';
+// iOS never evicts individual entries: a full origin just makes cache.put reject. So we cap the
+// count ourselves and drop the oldest (keys() returns insertion order). ~1000 covers ≈ 100-200MB.
+const COVER_MAX_ENTRIES = 1000;
 
 self.addEventListener('install', event => {
   console.log('SW installing');
@@ -41,7 +48,7 @@ self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys().then(keys => {
       return Promise.all(
-        keys.filter(key => key !== CACHE_NAME)
+        keys.filter(key => key !== CACHE_NAME && key !== COVER_CACHE)
           .map(key => caches.delete(key))
       );
     }).then(() => self.clients.claim())  // serve the already-open page too, not just the next load
@@ -61,6 +68,11 @@ self.addEventListener('activate', event => {
 const BYPASS = /^\/(audio|api|socket\.io)\//;
 
 self.addEventListener('fetch', event => {
+  if (event.request.method === 'GET' && event.request.destination === 'image'
+      && !event.request.url.startsWith(self.location.origin)) {
+    event.respondWith(serveCover(event));
+    return;
+  }
   if (!event.request.url.startsWith(self.location.origin)) return; // CDN etc. — pass through
   if (event.request.method !== 'GET') return;
   if (event.request.headers.has('range')) return;                  // media/byte-range requests
@@ -70,3 +82,43 @@ self.addEventListener('fetch', event => {
     caches.match(event.request).then(response => response || fetch(event.request))
   );
 });
+
+/**
+ * Cache-first for cross-origin cover images.
+ * Fetches in CORS mode so we get a real (non-opaque) response: we can check `ok` instead of
+ * blindly caching a 404, it stays usable by <img crossorigin> (LiquidGlass), and it avoids
+ * opaque-response quota padding. Hosts without CORS fall back to a plain uncached fetch.
+ * @param {FetchEvent} event
+ * @returns {Promise<Response>}
+ */
+async function serveCover(event) {
+  const url = event.request.url;
+  const cache = await caches.open(COVER_CACHE);
+  const hit = await cache.match(url);
+  if (hit) return hit;
+
+  let response;
+  try {
+    response = await fetch(url, { mode: 'cors', credentials: 'omit' });
+  } catch {
+    return fetch(event.request); // no CORS on this host (or offline) — don't cache
+  }
+  if (response.ok) {
+    event.waitUntil(
+      cache.put(url, response.clone())
+        .then(() => trimCoverCache(cache))
+        .catch(err => console.warn('SW cover cache put failed', err)) // e.g. QuotaExceededError
+    );
+  }
+  return response;
+}
+
+/**
+ * Drop the oldest covers once the cache exceeds COVER_MAX_ENTRIES.
+ * @param {Cache} cache
+ */
+async function trimCoverCache(cache) {
+  const keys = await cache.keys();
+  const excess = keys.length - COVER_MAX_ENTRIES;
+  if (excess > 0) await Promise.all(keys.slice(0, excess).map(k => cache.delete(k)));
+}

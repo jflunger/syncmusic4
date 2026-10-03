@@ -453,7 +453,7 @@ class SongItem extends HTMLElement {
         ${indicatorHtml}
         <div class="cover-wrap">
           <div class="cover ${isVinyl ? 'vinyl' : ''} ${isCurrent ? 'spinning' : ''} ${playing ? 'playing' : ''}">
-            ${cover ? `<img src="${this.escHtml(cover)}" alt="Cover">` : `<div class="no-cover">${sourceIcon}</div>`}
+            ${cover ? `<img src="${this.escHtml(cover)}" alt="Cover" loading="lazy" decoding="async">` : `<div class="no-cover">${sourceIcon}</div>`}
           </div>
         </div>
         <div class="details">

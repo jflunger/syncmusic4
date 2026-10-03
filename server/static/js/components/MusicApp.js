@@ -279,6 +279,7 @@ class MusicApp extends HTMLElement {
           playback.clearCurrent();
         }
       });
+      editor.addEventListener('show-related', (ev) => this.showRelated(ev.detail.song));
       editor.addEventListener('close', () => {});
       this.shadowRoot.appendChild(editor);
     });
@@ -294,6 +295,8 @@ class MusicApp extends HTMLElement {
     const tabButton = target.closest('.tab-button');
     if (tabButton) {
       const tab = tabButton.dataset.tab;
+      // Re-tapping the active tab takes it back to its default subtab.
+      if (tab === this.currentTab) this.tabElements[tab]?.showDefaultSubtab?.();
       appState.set('currentTab', tab);
     }
 
@@ -309,6 +312,15 @@ class MusicApp extends HTMLElement {
   searchOnline(query) {
     appState.set('currentTab', 'discover');
     this.tabElements.discover?.setSearchQuery(query);
+  }
+
+  /**
+   * Switch to the Discover tab and list tracks related to a library song.
+   * @param {Object} song - Library song (needs id, source)
+   */
+  showRelated(song) {
+    appState.set('currentTab', 'discover');
+    this.tabElements.discover?.showRelated(song);
   }
 
   /**

@@ -8,26 +8,15 @@ import appState from '../state/appState.js';
 import './LiquidGlass.js';
 import './PlaylistItem.js';
 
-/**
- * Cover-collapse tuning.
- *
- * As the user scrolls, the square album cover shrinks to `minHeight`. The
- * title + artist live *between* the cover and the (sticky) scrub bar, so they
- * scroll up and disappear behind the cover while the scrub bar stays pinned
- * just under it.
- *
- * `collapseScrollDistance` is the scroll distance (px) over which the cover
- * finishes collapsing. Tune it so the cover finishes shrinking right as the
- * title + artist have slid behind it — smaller = collapses sooner.
- */
-const COVER_COLLAPSE = {
-  minHeight: 96,              // collapsed cover height (keeps scaled buttons visible)
-  collapseScrollDistance: 220, // scroll px to fully collapse the cover
-};
-
 // Movement (px) before a scrub gesture locks its axis. Below this we don't know yet
 // whether the finger is scrubbing (horizontal) or scrolling the page (vertical).
 const SCRUB_AXIS_LOCK = 6;
+
+// Pull-to-reveal: dragging down from the top of the page fades out everything drawn
+// over the cover (controls + bottom fade) instead of scrolling. Fully revealed after
+// REVEAL_DISTANCE px of pull; on release it fades back in over REVEAL_RETURN_MS.
+const REVEAL_DISTANCE = 120;
+const REVEAL_RETURN_MS = 250;
 
 class PlayTab extends HTMLElement {
   constructor() {
@@ -45,8 +34,7 @@ class PlayTab extends HTMLElement {
 
     // Drag state. A scrub doesn't commit to "I'm a drag" until the finger has moved
     // enough to lock the axis to horizontal — a vertical move releases the gesture so the
-    // page scrolls (the scrub strip is full-width and lives under the cover, so swipes
-    // routinely begin on it).
+    // page scrolls (the scrub strip is full-width, so swipes routinely begin on it).
     this.isDragging = false;
     this.dragPosition = 0;
     this.progressRect = null;
@@ -57,10 +45,6 @@ class PlayTab extends HTMLElement {
     // History list expanded state
     this.historyExpanded = false;
 
-    // Sticky cover scroll state
-    this.boundScroll = this.handleScroll.bind(this);
-    this._scrollRaf = null;
-
     // Bound event handlers for cleanup. Pointer events cover mouse *and* touch, so the
     // scrubber drags identically on desktop and mobile.
     this.boundPointerMove = this.handleProgressPointerMove.bind(this);
@@ -68,6 +52,13 @@ class PlayTab extends HTMLElement {
     // A cancel (browser claimed the gesture for scrolling) must abort the scrub WITHOUT
     // emitting a seek, unlike a normal pointerup.
     this.boundPointerCancel = this.handleProgressPointerCancel.bind(this);
+
+    // Pull-to-reveal state. revealMode is null until the first move of a touch decides
+    // it: 'pull' (downward from the top → reveal) or 'pass' (leave it to the scroller).
+    this.revealMode = null;
+    this.revealStartY = 0;
+    this.revealAmount = 0;
+    this._revealRaf = null;
   }
 
   connectedCallback() {
@@ -194,95 +185,81 @@ class PlayTab extends HTMLElement {
     document.addEventListener('pointerup', this.boundPointerUp);
     document.addEventListener('pointercancel', this.boundPointerCancel);
 
-    // Sticky cover scroll handling
-    this.setupStickyCover();
+    // Pull-to-reveal. touchmove must be non-passive so a downward pull can cancel the
+    // page's scroll/rubber-band and drive the reveal instead.
+    this.addEventListener('touchstart', (e) => this.handleRevealStart(e), { passive: true });
+    this.addEventListener('touchmove', (e) => this.handleRevealMove(e), { passive: false });
+    this.addEventListener('touchend', () => this.handleRevealEnd());
+    this.addEventListener('touchcancel', () => this.handleRevealEnd());
   }
 
   /**
-   * Setup scroll listener for sticky cover shrink behavior
-   */
-  setupStickyCover() {
-    const scrollParent = this.getScrollParent();
-    if (scrollParent) {
-      scrollParent.addEventListener('scroll', this.boundScroll, { passive: true });
-      this._scrollParent = scrollParent;
-      // Recompute the square side / collapse distance when the viewport resizes.
-      window.addEventListener('resize', this.boundScroll, { passive: true });
-      // Initial check in case we're already scrolled
-      this.handleScroll();
-    }
-  }
-
-  /**
-   * Find the scrollable ancestor (tab-content in MusicApp)
+   * Find the scrollable ancestor (tab-content in MusicApp).
+   * @returns {HTMLElement|null}
    */
   getScrollParent() {
     let el = this.parentElement;
     while (el) {
-      const style = getComputedStyle(el);
-      const overflow = style.overflowY || style.overflow;
-      if (overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay') {
-        return el;
-      }
+      const overflow = getComputedStyle(el).overflowY;
+      if (overflow === 'auto' || overflow === 'scroll') return el;
       el = el.parentElement;
     }
     return null;
   }
 
   /**
-   * Handle scroll - shrink the cover proportionally with scroll.
-   *
-   * The cover is square at rest and collapses to COVER_COLLAPSE.minHeight over
-   * COVER_COLLAPSE.collapseScrollDistance px of scroll. Height is driven directly
-   * (width is fixed at 100%), so the cover image is only cropped vertically
-   * (centered, equal top/bottom) and never squished. An ease (smoothstep) tapers
-   * the shrink rate to zero at both ends so the content below transitions
-   * smoothly — no velocity "kink".
-   *
-   * The scrub bar (.progress-wrap) is sticky; we set its `top` to the cover's
-   * current height each frame so it stays glued just under the collapsing cover
-   * and remains visible at max contraction. The title/artist sit between the
-   * cover and the scrub bar, so they scroll up behind the sticky cover.
-   *
-   * To avoid scroll jitter, the height removed from the sticky cover is added
-   * back as host padding-bottom, keeping total scroll height constant.
+   * Begin tracking a touch for pull-to-reveal.
+   * @param {TouchEvent} e
    */
-  handleScroll() {
-    if (this.style.display === 'none') return;
-    if (this._scrollRaf) return;
-    this._scrollRaf = requestAnimationFrame(() => {
-      this._scrollRaf = null;
-      const scrollParent = this._scrollParent || this.getScrollParent();
-      if (!scrollParent) return;
+  handleRevealStart(e) {
+    if (e.touches.length !== 1) { this.revealMode = 'pass'; return; }
+    cancelAnimationFrame(this._revealRaf);
+    this.revealMode = null;
+    this.revealStartY = e.touches[0].clientY;
+  }
 
-      const coverInner = this.shadowRoot?.querySelector('.cover-inner');
-      if (!coverInner) return;
+  /**
+   * On the first move decide pull vs. scroll; while pulling, block the scroll and map
+   * pull distance to reveal amount.
+   * @param {TouchEvent} e
+   */
+  handleRevealMove(e) {
+    if (this.revealMode === 'pass' || this.isDragging) return;
+    const dy = e.touches[0].clientY - this.revealStartY;
+    if (this.revealMode === null) {
+      if (dy === 0) return;
+      const scroller = this.getScrollParent();
+      const atTop = !scroller || scroller.scrollTop <= 0;
+      this.revealMode = dy > 0 && atTop ? 'pull' : 'pass';
+      if (this.revealMode === 'pass') return;
+    }
+    if (e.cancelable) e.preventDefault();
+    this.setReveal(Math.min(1, Math.max(0, dy / REVEAL_DISTANCE)));
+  }
 
-      const minHeight = COVER_COLLAPSE.minHeight;
-      const maxHeight = coverInner.offsetWidth; // square side (width is fixed)
-      if (!maxHeight) return;
-      const distance = Math.max(1, COVER_COLLAPSE.collapseScrollDistance);
+  /**
+   * Finger lifted: fade the covering elements back in.
+   */
+  handleRevealEnd() {
+    if (this.revealMode !== 'pull') { this.revealMode = null; return; }
+    this.revealMode = null;
+    const from = this.revealAmount;
+    const start = performance.now();
+    const step = (now) => {
+      const t = Math.min(1, (now - start) / REVEAL_RETURN_MS);
+      this.setReveal(from * (1 - t) * (1 - t)); // ease-out
+      if (t < 1) this._revealRaf = requestAnimationFrame(step);
+    };
+    this._revealRaf = requestAnimationFrame(step);
+  }
 
-      const rawProgress = Math.min(1, Math.max(0, scrollParent.scrollTop / distance));
-      const progress = rawProgress * rawProgress * (3 - 2 * rawProgress); // smoothstep
-      const height = maxHeight - (maxHeight - minHeight) * progress;
-
-      // Skip redundant layout writes (e.g. resize ticks, or scrolling past full collapse):
-      // mutating geometry inside the scroller every frame can stall iOS momentum scrolling.
-      if (height === this._lastCoverHeight) return;
-      this._lastCoverHeight = height;
-
-      coverInner.style.height = `${height}px`;
-      coverInner.style.setProperty('--shrink-progress', String(progress));
-
-      // Glue the sticky scrub bar to the cover's current bottom edge so it pins
-      // just below the cover (never behind it) as the cover collapses.
-      const progressWrap = this.shadowRoot.querySelector('.progress-wrap');
-      if (progressWrap) progressWrap.style.top = `${height}px`;
-
-      // Reclaim the collapsed height so the page's scrollable range is stable.
-      this.style.paddingBottom = `${maxHeight - height}px`;
-    });
+  /**
+   * Apply reveal amount (0 = normal, 1 = cover fully uncovered) via the --reveal var.
+   * @param {number} amount
+   */
+  setReveal(amount) {
+    this.revealAmount = amount;
+    this.style.setProperty('--reveal', String(amount));
   }
 
   render() {
@@ -295,103 +272,104 @@ class PlayTab extends HTMLElement {
           height: calc(70px + env(safe-area-inset-bottom, 0px));
           flex: none;
         }
-        .cover-inner {
-          --shrink-progress: 0;
-          width: 100%;
-          /* Square by default; JS overrides height during scroll-collapse.
-             Height is driven directly (not aspect-ratio) so width never changes
-             and the image is only cropped vertically, never squished. */
-          aspect-ratio: 1;
-          position: sticky;
-          top: 0;
-          margin-top: 0;
-          z-index: 10;
-          overflow: hidden;
-          background: #333;
-          will-change: height;
-        }
-        .cover-content {
-          width: 100%;
-          height: 100%;
+        /* Cover hero: a full-width square at the top of the page with the album
+           art as its background. It scrolls away with the page like any other
+           content; the bottom fades into the page black so the title blends in. */
+        .cover-hero {
           position: relative;
-        }
-        /* Every cover is normalized to a full-width SQUARE (object-fit: cover
-           crops any source aspect ratio into it), centered vertically. The
-           square keeps its size as the container collapses, so overflow:hidden
-           just clips it equally top/bottom — identical behavior for all covers
-           regardless of their original dimensions. */
-        .cover-inner .cover-image,
-        .cover-inner .cover-placeholder {
-          position: absolute;
-          left: 0;
-          right: 0;
-          top: 50%;
-          transform: translateY(-50%);
           width: 100%;
           aspect-ratio: 1;
-          height: auto;
+          background-color: #333;
+          /* The fade is a background layer over the cover in the same box (not a
+             separate overlay element) so fractional-pixel rounding can't leave a
+             sliver of unfaded cover showing at the bottom edge. --cover is set
+             inline from the current song. */
+          background-image:
+            linear-gradient(to bottom, rgba(0,0,0,0) 65%, rgba(0,0,0,calc(1 - var(--reveal, 0))) 99%),
+            var(--cover, none);
+          background-size: 100% 100%, cover;
+          background-position: center;
+          background-repeat: no-repeat;
         }
-        .cover-inner .cover-image {
-          object-fit: cover;
-          object-position: center;
+        /* Gaussian blur over the whole cover (and its bottom fade). Uses
+           backdrop-filter so it blurs whatever the hero paints beneath it; fades
+           out with --reveal so pull-to-reveal shows the sharp cover. */
+        .cover-blur {
+          position: absolute;
+          inset: 0;
+          -webkit-backdrop-filter: blur(12px);
+          backdrop-filter: blur(12px);
+          opacity: calc(1 - var(--reveal, 0));
+          pointer-events: none;
         }
-        .cover-inner .cover-placeholder {
+        .cover-placeholder {
+          position: absolute;
+          inset: 0;
           display: flex;
           align-items: center;
           justify-content: center;
-          color: #666;
         }
+        .cover-hero.has-cover .cover-placeholder { display: none; }
         .control-buttons {
           position: absolute;
           inset: 0;
           display: flex;
           align-items: center;
           justify-content: center;
-          gap: 20px;
+          gap: 2%;
+          z-index: 1;
+          /* Pull-to-reveal fades the controls out with the bottom fade. */
+          opacity: calc(1 - var(--reveal, 0));
         }
+        /* The glass is the icon: big icon-shaped glass, sized off the cover width. */
+        .control-buttons liquid-glass { aspect-ratio: 1; width: 26%; }
+        .control-buttons .glass-play { width: 36%; }
+        /* Invisible hit target covering the whole glass. */
         .control-buttons button {
           background: none;
           border: none;
-          color: #fff;
-          width: 48px;
-          height: 48px;
-          border-radius: 50%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
+          padding: 0;
+          width: 100%;
+          height: 100%;
           cursor: pointer;
-          filter: drop-shadow(0 2px 8px rgba(0,0,0,0.5));
+          -webkit-tap-highlight-color: transparent;
         }
-        .control-buttons .play-pause-btn { background: transparent; width: 64px; height: 64px; }
-        /* Title + artist sit between the cover and the sticky scrub bar, so they
-           scroll up behind the sticky cover as it collapses. */
-        .song-info { color: #fff; text-align: center; padding: 16px 20px 12px; }
-        /* Always a single line so the cover-collapse geometry stays predictable. */
+        /* Title + artist on a frosted glass slab near the bottom of the cover. The slab
+           sizes to its text; it fades out with the controls on pull-to-reveal. */
+        .song-slab {
+          position: absolute;
+          left: 4%;
+          right: 4%;
+          bottom: 4%;
+          display: block;
+          z-index: 1;
+          opacity: calc(1 - var(--reveal, 0));
+        }
+        .song-info {
+          color: #fff;
+          text-align: center;
+          padding: 22px 32px;
+          text-shadow: 0 1px 4px rgba(0,0,0,0.35);
+        }
         .song-title {
-          font-size: 24px;
-          margin: 0 0 8px 0;
+          font-size: 20px;
+          margin: 0 0 6px 0;
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
         }
         .song-artist {
-          color: #aaa;
+          color: rgba(255,255,255,0.75);
           margin: 0;
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
         }
-        /* The scrub bar stays pinned just under the cover (JS sets 'top' to the
-           cover's current height) so it remains visible at max contraction. */
         .progress-wrap {
-          position: sticky;
-          top: 96px;
-          z-index: 5;
-          background: #000;
           /* Generous vertical padding makes the full strip a drag target — the bar
              itself is only 4px tall, too thin to grab on touch. touch-action:pan-y lets
              the browser keep vertical swipes as page scrolls (the strip spans the full
-             width under the cover, so scrolls routinely start here) while horizontal
+             width, so scrolls routinely start here) while horizontal
              drags are delivered to the scrubber. */
           padding: 16px 20px;
           display: flex;
@@ -459,45 +437,30 @@ class PlayTab extends HTMLElement {
         }
       </style>
 
-      <div class="cover-inner">
-        <div class="cover-content">
-        ${this.currentSong && this.currentSong.cover ?
-          `<img class="cover-image" src="${this.currentSong.cover}" alt="Album cover">` :
-          `<div class="cover-placeholder">
-            <svg viewBox="0 0 24 24" width="64" height="64" fill="#666">
-              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-5-8h10v2H7v-2z"/>
-            </svg>
-          </div>`
-        }
+      <div class="cover-hero ${this.currentSong?.cover ? 'has-cover' : ''}"${this.coverStyle()}>
+        <div class="cover-placeholder">
+          <svg viewBox="0 0 24 24" width="64" height="64" fill="#666">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-5-8h10v2H7v-2z"/>
+          </svg>
+        </div>
+        <div class="cover-blur"></div>
         <div class="control-buttons">
-          <liquid-glass class="glass-prev" src="${this.currentSong?.cover || ''}" style="width:60px;height:60px">
-            <button class="prev-btn">
-              <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
-                <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/>
-              </svg>
-            </button>
+          <liquid-glass class="glass-prev" shape="prev" src="${this.currentSong?.cover || ''}">
+            <button class="prev-btn" aria-label="Previous"></button>
           </liquid-glass>
-
-          <liquid-glass class="glass-play" accent="#8000FF" src="${this.currentSong?.cover || ''}" style="width:88px;height:88px">
-            <button class="play-pause-btn">
-              ${this.renderPlayPauseIcon()}
-            </button>
+          <liquid-glass class="glass-play" shape="${this.isPlaying ? 'pause' : 'play'}" accent="#8000FF" src="${this.currentSong?.cover || ''}">
+            <button class="play-pause-btn" aria-label="${this.isPlaying ? 'Pause' : 'Play'}"></button>
           </liquid-glass>
-
-          <liquid-glass class="glass-next" src="${this.currentSong?.cover || ''}" style="width:60px;height:60px">
-            <button class="next-btn">
-              <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
-                <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/>
-              </svg>
-            </button>
+          <liquid-glass class="glass-next" shape="next" src="${this.currentSong?.cover || ''}">
+            <button class="next-btn" aria-label="Next"></button>
           </liquid-glass>
         </div>
-        </div>
-      </div>
-
-      <div class="song-info">
-        <h2 class="song-title">${this.currentSong ? this.currentSong.title : 'No song selected'}</h2>
-        <p class="song-artist">${this.currentSong ? this.currentSong.artist : 'Unknown artist'}</p>
+        <liquid-glass class="song-slab" shape="slab" blur="22" accent="#000000" src="${this.currentSong?.cover || ''}">
+          <div class="song-info">
+            <h2 class="song-title">${this.currentSong ? this.currentSong.title : 'No song selected'}</h2>
+            <p class="song-artist">${this.currentSong ? this.currentSong.artist : 'Unknown artist'}</p>
+          </div>
+        </liquid-glass>
       </div>
 
       <div class="progress-wrap">
@@ -544,9 +507,16 @@ class PlayTab extends HTMLElement {
         this.shadowRoot.querySelectorAll('.history-list song-item'),
         (this.history || []).slice(0, 10)
       );
-      // Re-sync sticky shrink state after DOM replaced
-      this.handleScroll();
     });
+  }
+
+  /**
+   * Inline style attribute that sets the current cover as the hero background.
+   * @returns {string}
+   */
+  coverStyle() {
+    const cover = this.currentSong?.cover;
+    return cover ? ` style="--cover: url(&quot;${cover}&quot;)"` : '';
   }
 
   /**
@@ -555,7 +525,7 @@ class PlayTab extends HTMLElement {
   renderCurrentSong() {
     const titleEl = this.shadowRoot.querySelector('.song-title');
     const artistEl = this.shadowRoot.querySelector('.song-artist');
-    const coverContent = this.shadowRoot.querySelector('.cover-content');
+    const hero = this.shadowRoot.querySelector('.cover-hero');
 
     if (titleEl) {
       titleEl.textContent = this.currentSong ? this.currentSong.title : 'No song selected';
@@ -565,17 +535,11 @@ class PlayTab extends HTMLElement {
       artistEl.textContent = this.currentSong ? this.currentSong.artist : 'Unknown artist';
     }
 
-    if (coverContent) {
-      const oldCover = coverContent.querySelector('.cover-image, .cover-placeholder');
-      const newCover = this.currentSong && this.currentSong.cover
-        ? `<img class="cover-image" src="${this.currentSong.cover}" alt="Album cover">`
-        : `<div class="cover-placeholder">
-            <svg viewBox="0 0 24 24" width="64" height="64" fill="#666">
-              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-5-8h10v2H7v-2z"/>
-            </svg>
-          </div>`;
-      if (oldCover) oldCover.remove();
-      coverContent.insertAdjacentHTML('afterbegin', newCover);
+    if (hero) {
+      const cover = this.currentSong?.cover || '';
+      hero.classList.toggle('has-cover', !!cover);
+      if (cover) hero.style.setProperty('--cover', `url("${cover}")`);
+      else hero.style.removeProperty('--cover');
     }
 
     const coverSrc = this.currentSong?.cover || '';
@@ -588,10 +552,10 @@ class PlayTab extends HTMLElement {
    * Render play/pause button
    */
   renderPlayPause() {
+    const glass = this.shadowRoot.querySelector('.glass-play');
     const btn = this.shadowRoot.querySelector('.play-pause-btn');
-    if (btn) {
-      btn.innerHTML = this.renderPlayPauseIcon();
-    }
+    if (glass) glass.setAttribute('shape', this.isPlaying ? 'pause' : 'play');
+    if (btn) btn.setAttribute('aria-label', this.isPlaying ? 'Pause' : 'Play');
   }
 
   /**
@@ -840,17 +804,6 @@ class PlayTab extends HTMLElement {
     return Math.max(0, Math.min(1, x / this.progressRect.width));
   }
 
-  /**
-   * Render play/pause icon
-   */
-  renderPlayPauseIcon() {
-    // Explicit width/height + fill are required: iOS Safari collapses an inline SVG
-    // that has only a viewBox inside a flex container, hiding the icon entirely.
-    return this.isPlaying
-      ? '<svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>'
-      : '<svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
-  }
-
   disconnectedCallback() {
     if (this.unsubscribeState) {
       this.unsubscribeState();
@@ -860,13 +813,6 @@ class PlayTab extends HTMLElement {
     document.removeEventListener('pointermove', this.boundPointerMove);
     document.removeEventListener('pointerup', this.boundPointerUp);
     document.removeEventListener('pointercancel', this.boundPointerCancel);
-
-    // Clean up sticky cover scroll listener
-    if (this._scrollParent) {
-      this._scrollParent.removeEventListener('scroll', this.boundScroll);
-      this._scrollParent = null;
-    }
-    window.removeEventListener('resize', this.boundScroll);
   }
 }
 

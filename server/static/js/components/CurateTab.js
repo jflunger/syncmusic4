@@ -873,6 +873,23 @@ class CurateTab extends HTMLElement {
   }
 
   /**
+   * Return to the default view — the Tracks subtab with no search, so the
+   * evergreens show. Used when the tab button is re-tapped.
+   */
+  showDefaultSubtab() {
+    if (this.activeSubtab === 'tracks' && !this.searchQueryRaw) return;
+    this.searchQueryRaw = '';
+    this.searchQuery = '';
+    const input = this.shadowRoot.querySelector('.search-input');
+    if (input) {
+      input.value = '';
+      input.blur();
+    }
+    this.activeSubtab = 'tracks';
+    this.render();
+  }
+
+  /**
    * Set a playlist as the working playlist and switch to working tab
    */
   setWorkingPlaylist(playlist) {
