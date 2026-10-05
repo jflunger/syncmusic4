@@ -6,6 +6,8 @@
  *     is laid out in flow, so the element sizes to it (e.g. a text panel).
  *   accent: optional #rrggbb tint
  *   blur: optional frosting radius in CSS px (0 = clear glass)
+ *   fill, fill-color: slab only — floods the glass with fill-color (#rrggbb) from the
+ *     left edge to `fill` (0..1) of its width, e.g. a progress bar that *is* the slab.
  * The glass itself *is* the icon: the shape is a signed distance field in the fragment
  * shader, and the glass refracts `src` (the image painted behind the element's parent,
  * laid out like CSS `background-size: cover`) through a rounded bevel along its outline.
@@ -33,10 +35,13 @@ uniform float uMorph;      // 0 = uShapeFrom, 1 = uShapeTo
 uniform vec4 uTint;
 uniform vec2 uHalf;        // element half-extents in shape units (1 along the short side)
 uniform float uBlur;       // frosting radius in canvas px (0 = clear)
+uniform float uFill;       // slab fill fraction, left to right (0..1)
+uniform vec4 uFillColor;   // a = 0 disables the fill
 
 const float BEVEL = 0.22;      // bevel width, in shape units (box half-size = 1)
 const float REFRACT = 0.16;    // how far edges pull the image inward
 const float DISPERSION = 0.04; // per-channel refraction spread (chromatic edge)
+const float SLAB_INSET = 0.25; // slab outline inset from the element edge (room for shadow)
 
 float sdBox(vec2 p, vec2 b) {
   vec2 d = abs(p) - b;
@@ -70,9 +75,8 @@ float skipShape(vec2 p) {
 
 // Rounded rectangle filling the element, inset so its shadow fits.
 float slabSdf(vec2 p) {
-  const float INSET = 0.25;
   const float RADIUS = 0.45;
-  return sdBox(p, uHalf - INSET - RADIUS) - RADIUS;
+  return sdBox(p, uHalf - SLAB_INSET - RADIUS) - RADIUS;
 }
 
 float iconSdf(float shape, vec2 p) {
@@ -155,6 +159,14 @@ void main() {
   col = mix(col, vec3(1.0), 0.10);
   if (uTint.a > 0.001) col = mix(col, uTint.rgb, uTint.a * 0.3);
 
+  // Fill: colour the glass up to uFill of the slab's width (before lighting, so the
+  // bevel highlights still sit on top and it reads as coloured glass).
+  if (uFillColor.a > 0.001) {
+    float halfW = uHalf.x - SLAB_INSET;
+    float fillX = -halfW + 2.0 * halfW * uFill;
+    col = mix(col, uFillColor.rgb, smoothstep(px, -px, p.x - fillX) * 0.7);
+  }
+
   // Lighting: specular on the edge facing the light (top-left), faint rim on the far
   // edge, and a thin bright line hugging the outline.
   vec2 light = normalize(vec2(-0.6, 0.8));
@@ -176,7 +188,7 @@ const PRESS_MIN_MS = 110;
 
 class LiquidGlass extends HTMLElement {
   static get observedAttributes() {
-    return ['src', 'accent', 'shape', 'blur'];
+    return ['src', 'accent', 'shape', 'blur', 'fill', 'fill-color'];
   }
 
   constructor() {
@@ -353,6 +365,8 @@ class LiquidGlass extends HTMLElement {
       tint: gl.getUniformLocation(program, 'uTint'),
       half: gl.getUniformLocation(program, 'uHalf'),
       blur: gl.getUniformLocation(program, 'uBlur'),
+      fill: gl.getUniformLocation(program, 'uFill'),
+      fillColor: gl.getUniformLocation(program, 'uFillColor'),
     };
 
     this._texture = gl.createTexture();
@@ -406,9 +420,16 @@ class LiquidGlass extends HTMLElement {
    * @returns {{offset: number[], scale: number[]}}
    */
   _texMapping() {
-    const me = this.getBoundingClientRect();
+    let me = this.getBoundingClientRect();
     const parent = this.parentElement?.getBoundingClientRect();
     if (!parent || !parent.width || !parent.height) return { offset: [0, 0], scale: [1, 1] };
+    // Slabs map from their layout box, ignoring transforms, so a slab a host translates
+    // (e.g. pinned on screen while the page scrolls) keeps showing the same patch of image.
+    if (this.getAttribute('shape') === 'slab' && this.offsetParent === this.parentElement) {
+      const left = parent.left + this.offsetLeft;
+      const top = parent.top + this.offsetTop;
+      me = { left, width: this.offsetWidth, height: this.offsetHeight, bottom: top + this.offsetHeight };
+    }
 
     // Element box within the parent, as parent uv.
     const ox = (me.left - parent.left) / parent.width;
@@ -470,15 +491,23 @@ class LiquidGlass extends HTMLElement {
     gl.bindTexture(gl.TEXTURE_2D, this._texture);
     gl.uniform1i(this._uniforms.image, 0);
 
-    const accent = this.getAttribute('accent');
-    if (accent && /^#[0-9a-fA-F]{6}$/.test(accent)) {
-      const c = [1, 3, 5].map(i => parseInt(accent.slice(i, i + 2), 16) / 255);
-      gl.uniform4f(this._uniforms.tint, c[0], c[1], c[2], 1);
-    } else {
-      gl.uniform4f(this._uniforms.tint, 0, 0, 0, 0);
-    }
+    gl.uniform4f(this._uniforms.tint, ...this._colorAttr('accent'));
+    gl.uniform4f(this._uniforms.fillColor, ...this._colorAttr('fill-color'));
+    const fill = parseFloat(this.getAttribute('fill')) || 0;
+    gl.uniform1f(this._uniforms.fill, Math.max(0, Math.min(1, fill)));
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  /**
+   * Read a #rrggbb attribute as an rgba uniform; alpha 0 when missing or malformed.
+   * @param {string} name
+   * @returns {number[]}
+   */
+  _colorAttr(name) {
+    const v = this.getAttribute(name);
+    if (!v || !/^#[0-9a-fA-F]{6}$/.test(v)) return [0, 0, 0, 0];
+    return [...[1, 3, 5].map(i => parseInt(v.slice(i, i + 2), 16) / 255), 1];
   }
 }
 

@@ -88,6 +88,55 @@ def playlist_owned_by(conn, playlist_id, user):
     ).fetchone()
     return row is not None
 
+ORPHANS_KIND = 'orphans'
+
+def is_orphans_playlist(conn, playlist_id):
+    """True if the playlist is an auto-maintained Orphans playlist."""
+    row = conn.execute('SELECT kind FROM playlists WHERE id = ?', (playlist_id,)).fetchone()
+    return row is not None and row['kind'] == ORPHANS_KIND
+
+def refresh_orphans(conn, user):
+    """
+    Create (if needed) and refill the user's Orphans playlist: every library
+    song that isn't in any of the user's other playlists, newest first.
+
+    Only rewrites playlist_songs when the contents actually changed. Commits.
+    """
+    if not user:
+        return
+    row = conn.execute('SELECT id FROM playlists WHERE owner = ? AND kind = ?',
+                       (user, ORPHANS_KIND)).fetchone()
+    if row:
+        orphans_id = row['id']
+    else:
+        orphans_id = conn.execute(
+            'INSERT INTO playlists (name, owner, kind, description) VALUES (?, ?, ?, ?)',
+            ('Orphans', user, ORPHANS_KIND, 'Tracks that are not in any other playlist')
+        ).lastrowid
+
+    wanted = [r['id'] for r in conn.execute('''
+        SELECT s.id FROM songs s
+        WHERE s.id NOT IN (
+            SELECT ps.song_id FROM playlist_songs ps
+            JOIN playlists p ON p.id = ps.playlist_id
+            WHERE p.owner = ? AND p.id != ?
+        )
+        ORDER BY s.id DESC
+    ''', (user, orphans_id)).fetchall()]
+    current = [r['song_id'] for r in conn.execute(
+        'SELECT song_id FROM playlist_songs WHERE playlist_id = ? ORDER BY position',
+        (orphans_id,)).fetchall()]
+    if wanted != current:
+        conn.execute('DELETE FROM playlist_songs WHERE playlist_id = ?', (orphans_id,))
+        conn.executemany(
+            'INSERT INTO playlist_songs (playlist_id, song_id, position) VALUES (?, ?, ?)',
+            [(orphans_id, song_id, i + 1) for i, song_id in enumerate(wanted)])
+    conn.commit()
+
+def orphans_refusal():
+    """Standard 400 for edits the auto-maintained Orphans playlist doesn't allow."""
+    return jsonify({'error': 'Orphans is maintained automatically'}), 400
+
 def yt_dlp_cookie_args(source):
     """
     Return yt-dlp --cookies args for the given feeder source, or [].
@@ -294,6 +343,18 @@ def migrate_add_playlist_icon():
     conn.commit()
     conn.close()
 
+def migrate_add_playlist_kind():
+    """Add a kind column to playlists. NULL is an ordinary playlist; 'orphans'
+    marks the per-account auto-maintained Orphans playlist (see refresh_orphans)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(playlists)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if 'kind' not in columns:
+        cursor.execute('ALTER TABLE playlists ADD COLUMN kind TEXT')
+    conn.commit()
+    conn.close()
+
 def migrate_add_playlist_owner():
     """Add owner column to playlists. Existing (owner-less) playlists are
     deleted so accounts start clean — songs and audio files are untouched."""
@@ -335,6 +396,22 @@ def migrate_queue_per_account():
 
 # Playlist icon upload directory
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), 'static', 'uploads', 'playlist-icons')
+
+def playlist_icon_url(icon_val):
+    """Public URL for a stored playlist icon path, versioned by file mtime.
+
+    Icons are overwritten in place (<id>.<ext>), so the ?v= suffix is what lets
+    serve_static mark /uploads/ immutable and the service worker cache it
+    forever: a replaced icon gets a new URL instead of a stale cache hit.
+    """
+    if not icon_val:
+        return None
+    raw = str(icon_val).replace(os.sep, '/').lstrip('/')
+    try:
+        version = int(os.path.getmtime(os.path.join(app.root_path, 'static', raw)))
+    except OSError:
+        return f"/{raw}"
+    return f"/{raw}?v={version}"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Initialize database on startup
@@ -343,6 +420,7 @@ migrate_add_start_end_time()
 migrate_add_playlist_description()
 migrate_add_playlist_icon()
 migrate_add_playlist_owner()
+migrate_add_playlist_kind()
 migrate_queue_per_account()
 
 import related_tracks
@@ -407,10 +485,14 @@ def serve_static(path):
     The app shell (HTML/JS/CSS/manifest/service worker) must always revalidate or
     phones get pinned to stale code — Flask's default caching plus the cache-first
     service worker otherwise serve old files indefinitely. Audio is large and
-    immutable, so it keeps the default cacheable headers.
+    immutable, so it keeps the default cacheable headers. Uploads (playlist
+    icons) are requested with a ?v=<mtime> suffix (playlist_icon_url), so they
+    are cached as immutable.
     """
     resp = send_from_directory('static', path)
-    if not path.startswith('audio/'):
+    if path.startswith('uploads/'):
+        resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    elif not path.startswith('audio/'):
         resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     return resp
 
@@ -771,15 +853,21 @@ def get_playlists():
         JSON response with playlist data
     """
     conn = get_db_connection()
+    # A broken Orphans refresh must never hide the user's real playlists.
+    try:
+        refresh_orphans(conn, current_user())
+    except Exception as e:
+        conn.rollback()
+        print(f"[Orphans] refresh failed: {e}")
 
-    # Get the current user's playlists with song counts
+    # Get the current user's playlists with song counts (Orphans pinned last)
     playlists = conn.execute('''
-        SELECT p.id, p.name, p.description, p.icon, p.created_at, COUNT(ps.song_id) as song_count
+        SELECT p.id, p.name, p.description, p.icon, p.kind, p.created_at, COUNT(ps.song_id) as song_count
         FROM playlists p
         LEFT JOIN playlist_songs ps ON p.id = ps.playlist_id
         WHERE p.owner = ?
         GROUP BY p.id
-        ORDER BY p.created_at DESC
+        ORDER BY p.kind IS NOT NULL, p.created_at DESC
     ''', (current_user(),)).fetchall()
 
     playlists_list = []
@@ -806,16 +894,13 @@ def get_playlists():
                 'end_time': song['end_time'] if 'end_time' in song.keys() else None
             })
 
-        icon_url = None
-        icon_val = playlist['icon'] if 'icon' in playlist.keys() else None
-        if icon_val:
-            raw = str(icon_val).replace(os.sep, '/')
-            icon_url = f"/{raw}" if not raw.startswith('/') else raw
+        icon_url = playlist_icon_url(playlist['icon'] if 'icon' in playlist.keys() else None)
         playlists_list.append({
             'id': playlist['id'],
             'name': playlist['name'],
             'description': playlist['description'] if 'description' in playlist.keys() else None,
             'icon': icon_url,
+            'kind': playlist['kind'],
             'songs': songs_list,
             'created_at': playlist['created_at']
         })
@@ -891,6 +976,8 @@ def add_song_to_playlist(playlist_id):
         # Check the playlist exists and belongs to this user
         if not playlist_owned_by(conn, playlist_id, current_user()):
             return jsonify({'error': 'Playlist not found'}), 404
+        if is_orphans_playlist(conn, playlist_id):
+            return orphans_refusal()
 
         # Check if song exists
         song = cursor.execute('SELECT id FROM songs WHERE id = ?', (song_id,)).fetchone()
@@ -931,6 +1018,8 @@ def remove_song_from_playlist(playlist_id, song_id):
     try:
         if not playlist_owned_by(conn, playlist_id, current_user()):
             return jsonify({'error': 'Playlist not found'}), 404
+        if is_orphans_playlist(conn, playlist_id):
+            return orphans_refusal()
 
         result = cursor.execute(
             'DELETE FROM playlist_songs WHERE playlist_id = ? AND song_id = ?',
@@ -988,8 +1077,7 @@ def update_playlist(playlist_id):
             params.append(desc)
 
         if not updates:
-            icon_val = playlist['icon'] if 'icon' in playlist.keys() else None
-            icon_url = f"/{icon_val}" if icon_val and not str(icon_val).startswith('/') else (icon_val or None)
+            icon_url = playlist_icon_url(playlist['icon'] if 'icon' in playlist.keys() else None)
             return jsonify({
                 'id': playlist['id'],
                 'name': playlist['name'],
@@ -1002,8 +1090,7 @@ def update_playlist(playlist_id):
         conn.commit()
 
         updated = cursor.execute('SELECT * FROM playlists WHERE id = ?', (playlist_id,)).fetchone()
-        icon_val = updated['icon'] if 'icon' in updated.keys() else None
-        icon_url = f"/{icon_val}" if icon_val and not str(icon_val).startswith('/') else (icon_val or None)
+        icon_url = playlist_icon_url(updated['icon'] if 'icon' in updated.keys() else None)
         return jsonify({
             'id': updated['id'],
             'name': updated['name'],
@@ -1058,9 +1145,8 @@ def upload_playlist_icon(playlist_id):
 
         cursor.execute('UPDATE playlists SET icon = ? WHERE id = ?', (rel_path, playlist_id))
         conn.commit()
-        icon_url = f"/{rel_path}"
         conn.close()
-        return jsonify({'icon': icon_url})
+        return jsonify({'icon': playlist_icon_url(rel_path)})
     except Exception as e:
         conn.rollback()
         conn.close()
@@ -1146,7 +1232,7 @@ def use_feeder_icon(playlist_id):
         cursor.execute('UPDATE playlists SET icon = ? WHERE id = ?', (rel_path, playlist_id))
         conn.commit()
         conn.close()
-        return jsonify({'icon': f"/{rel_path}"})
+        return jsonify({'icon': playlist_icon_url(rel_path)})
     except Exception as e:
         conn.rollback()
         conn.close()
@@ -1198,6 +1284,8 @@ def delete_playlist(playlist_id):
                                   (playlist_id, current_user())).fetchone()
         if not playlist:
             return jsonify({'error': 'Playlist not found'}), 404
+        if is_orphans_playlist(conn, playlist_id):
+            return orphans_refusal()
         if 'icon' in playlist.keys() and playlist['icon']:
             icon_path = os.path.join(app.root_path, 'static', playlist['icon'])
             if os.path.isfile(icon_path):
@@ -1323,6 +1411,8 @@ def add_feeder(playlist_id):
     try:
         if not playlist_owned_by(conn, playlist_id, current_user()):
             return jsonify({'error': 'Playlist not found'}), 404
+        if is_orphans_playlist(conn, playlist_id):
+            return orphans_refusal()
 
         # Detect source from URL
         source = None
@@ -1442,6 +1532,8 @@ def trigger_sync(playlist_id):
     try:
         if not playlist_owned_by(conn, playlist_id, current_user()):
             return jsonify({'error': 'Playlist not found'}), 404
+        if is_orphans_playlist(conn, playlist_id):
+            return orphans_refusal()
 
         feeders = cursor.execute(
             'SELECT * FROM feeder_playlists WHERE playlist_id = ?', (playlist_id,)
@@ -1791,6 +1883,27 @@ def search_songs():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+def enqueue_related_if_stale(conn, song_id, source, url, fetch=None):
+    """
+    Queue a background related-tracks lookup for a library song when its
+    stored results are missing or older than REFETCH_AFTER. No-op for
+    platforms without related tracks or songs without a source URL.
+
+    Args:
+        fetch: the song's related_fetches row if already loaded (else read here)
+
+    Returns:
+        bool: True if a lookup was newly queued
+    """
+    source = (source or '').lower()
+    if source not in related_tracks.SOURCES or not url:
+        return False
+    if fetch is None:
+        fetch = conn.execute('SELECT * FROM related_fetches WHERE song_id = ?', (song_id,)).fetchone()
+    if not related_tracks.is_stale(fetch):
+        return False
+    return related_manager.enqueue(song_id, source, url)
+
 @app.route('/api/songs/<int:song_id>/related')
 def get_song_related(song_id):
     """
@@ -1814,8 +1927,7 @@ def get_song_related(song_id):
             return jsonify({'error': 'Related tracks are only supported for YouTube and SoundCloud'}), 400
 
         fetch, results = related_tracks.load_related(conn, song_id)
-        if related_tracks.is_stale(fetch):
-            related_manager.enqueue(song_id, source, song['download_link'])
+        enqueue_related_if_stale(conn, song_id, source, song['download_link'], fetch)
 
         # Mark results already in the library (matched on their source URL).
         urls = [r['url'] for r in results]
@@ -2092,6 +2204,9 @@ def log_listen():
         song_id: int  - the song that was listened to
         seconds: float - how much of it was actually played
 
+    A counted listen also queues a background related-tracks lookup for the
+    song when its stored results are missing or stale.
+
     Returns 200 {success, logged} — `logged` is False when the play was too
     short to count, which is not an error.
     """
@@ -2117,7 +2232,7 @@ def log_listen():
     cursor = conn.cursor()
     try:
         song = conn.execute(
-            'SELECT title, artist FROM songs WHERE id = ?', (song_id,)
+            'SELECT title, artist, source, download_link FROM songs WHERE id = ?', (song_id,)
         ).fetchone()
         if song is None:
             return jsonify({'error': 'Song not found'}), 404
@@ -2128,6 +2243,7 @@ def log_listen():
         )
         conn.commit()
         listen_id = cursor.lastrowid
+        enqueue_related_if_stale(conn, song_id, song['source'], song['download_link'])
     except Exception as e:
         conn.rollback()
         return jsonify({'error': str(e)}), 500

@@ -10,7 +10,7 @@ SyncMusic4 is a self-hosted music streaming + library-sync web app. Users search
 
 ```bash
 pip install -r requirements.txt        # installs flask, spotipy, yt-dlp, soundcloud-v2, votify (from git)
-python server/app.py                   # main server on http://0.0.0.0:5000
+python server/app.py                   # listens on $PORT (default 8008) — in prod vibe runs it, see below
 ```
 
 The app is served at `/` from `server/static/`. There is no build step, no bundler, no test runner config — tests are standalone scripts:
@@ -25,28 +25,29 @@ From `.clinerules`: **do not run ad-hoc/complex Python in the console to "test" 
 
 External CLI tools must be on PATH: `yt-dlp` (YouTube/SoundCloud audio) and `votify` (Spotify download, needs `cookies.txt` in the repo root). Spotify *search* credentials are hardcoded in `server/spotify_search.py`; `credentials.json` / `.cache` hold votify/Spotify auth state.
 
-## Deploying and restarting
+## Production: this machine
 
-The app runs on a Hetzner box (`root@<server-ip>`, `~/syncmusic4`) behind nginx
-at https://sm4.adun.ai, served by waitress on port 8008. `./deploy.sh` drives it all:
+**This checkout is production.** `/root/syncmusic4` on the Hetzner box (<server-ip>)
+is the live app behind nginx at https://sm4.adun.ai, and `server/music.db` here is
+the live database. There is no separate deploy step: edits here go live on the next
+restart. Treat the DB as production data — query it read-only (`sqlite3 -readonly`)
+unless a write is intended.
 
-```bash
-./deploy.sh up          # deploy + restart — the usual one
-./deploy.sh restart     # restart only
-./deploy.sh status      # tmux session, port, pid, health
-./deploy.sh logs -100   # tail the tmux pane
-```
+The app is a **vibe** project (`VIBE_PROJECT=syncmusic4`). vibe runs `./run.sh` in
+the tmux session `p-syncmusic4` with `PORT=8008` (the port nginx proxies to);
+output goes to `/var/lib/vibe/logs/syncmusic4.log`. nginx config:
+`deploy/nginx-sm4.conf`.
 
-`start.sh` is a **supervisor loop**, not a one-shot launcher — it is what the tmux
-window `main:syncmusic4` runs. `POST /api/admin/restart` (shared key in
-`admin_key.txt`, not a login session) makes the app `os._exit(42)`; the loop reads
-42 as "relaunch" and brings it back. Any other non-zero code is treated as a crash
-and also restarts, after a 3s pause. Only Ctrl-C in the tmux window (or exit 0)
-breaks the loop — that is a real stop.
+- Restart / status / logs: use the vibe MCP tools `project_restart`,
+  `project_status`, `project_logs`. After a runtime change, restart and read the
+  returned logs to confirm the app came back.
+- Never start, kill or daemonize the app yourself (no `nohup`, `&`, `pkill`).
+- Don't commit — vibe commits nightly.
 
-So: **never restart by killing the process.** `pkill -f 'server/app.py'` over ssh
-matches the SSH command's own argv and kills the session; and a kill leaves the
-loop to respawn it anyway. Use `./deploy.sh restart`.
+`run.sh` execs `start.sh`, which is a **supervisor loop**, not a one-shot launcher:
+`POST /api/admin/restart` (shared key in `admin_key.txt`) makes the app
+`os._exit(42)` and the loop relaunches it; any other non-zero exit is treated as a
+crash and restarted after 3s; exit 0 (or Ctrl-C) stops the loop.
 
 ## Backend architecture
 
@@ -61,6 +62,8 @@ Data lives in `server/music.db` (SQLite). Core tables: `songs`, `playlists`, `pl
 ## Frontend architecture
 
 Lives in `server/static/`, loaded directly by the browser as ES modules — **no React/Vue, no Webpack/Vite, no JSX**. Adding a framework or build tool is explicitly forbidden by the project rules (`.cursor/rules`, `.kilocode/rules`, `.clinerules` — all identical).
+
+**Bump the service-worker cache after every frontend change.** `server/static/sw.js` is cache-first, so a UI change (any JS/CSS/HTML under `static/`) stays invisible to clients until `CACHE_NAME` (`'syncmusic-vN'`) is incremented. Do it as part of the change itself, not as an afterthought — a hard refresh or server restart alone does not help.
 
 - `static/js/components/` — native Web Components (Shadow DOM). `MusicApp.js` is the root; it owns the single `<audio>` element and mounts the three tabs once each (`DiscoverTab`, `CurateTab`, `PlayTab`), toggling visibility rather than re-creating them.
 - `static/js/state/appState.js` — single Proxy-based reactive store (`appState`). Setting a property notifies subscribers, which re-render. **State is the source of truth, never the DOM.**

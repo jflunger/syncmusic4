@@ -398,6 +398,9 @@ class MusicApp extends HTMLElement {
       appState.set('playlists', updatedPlaylists);
       const updatedWp = updatedPlaylists.find(p => p.id === wp.id);
       appState.set('workingPlaylist', updatedWp ? { ...updatedWp } : wp);
+
+      // Membership changed, so the server-maintained Orphans playlist may have too.
+      fetchPlaylists().then(fresh => { if (fresh) appState.set('playlists', fresh); });
     } catch (err) {
       console.error('Playlist toggle failed:', err);
       alert(add ? 'Failed to add song to playlist' : 'Failed to remove song from playlist');

@@ -6,7 +6,7 @@
 // asset. The fetch handler is cache-first, so clients keep serving the old copy until
 // CACHE_NAME changes — forgetting this is how the iOS PWA fullscreen fix keeps "regressing"
 // even when the source files are correct. See docs/ios-pwa-fullscreen.md.
-const CACHE_NAME = 'syncmusic-v29';
+const CACHE_NAME = 'syncmusic-v39';
 const CACHE_FILES = [
   '/',
   '/index.html',
@@ -24,7 +24,8 @@ const CACHE_FILES = [
 ];
 
 // Cover art lives in its own cache so it survives CACHE_NAME bumps. Covers are immutable CDN
-// URLs (i.ytimg.com, *.sndcdn.com), so cache-first with no revalidation is safe.
+// URLs (i.ytimg.com, *.sndcdn.com), so cache-first with no revalidation is safe. Playlist icons
+// (/uploads/...?v=<mtime>) share it: the server versions the URL, so a replaced icon is a new key.
 const COVER_CACHE = 'syncmusic-covers-v1';
 // iOS never evicts individual entries: a full origin just makes cache.put reject. So we cap the
 // count ourselves and drop the oldest (keys() returns insertion order). ~1000 covers ≈ 100-200MB.
@@ -69,7 +70,7 @@ const BYPASS = /^\/(audio|api|socket\.io)\//;
 
 self.addEventListener('fetch', event => {
   if (event.request.method === 'GET' && event.request.destination === 'image'
-      && !event.request.url.startsWith(self.location.origin)) {
+      && (!event.request.url.startsWith(self.location.origin) || isPlaylistIcon(event.request.url))) {
     event.respondWith(serveCover(event));
     return;
   }
@@ -84,7 +85,17 @@ self.addEventListener('fetch', event => {
 });
 
 /**
- * Cache-first for cross-origin cover images.
+ * Versioned playlist icon on our own origin (see playlist_icon_url in app.py).
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isPlaylistIcon(url) {
+  const u = new URL(url);
+  return u.origin === self.location.origin && u.pathname.startsWith('/uploads/') && u.searchParams.has('v');
+}
+
+/**
+ * Cache-first for cover images (cross-origin covers and versioned playlist icons).
  * Fetches in CORS mode so we get a real (non-opaque) response: we can check `ok` instead of
  * blindly caching a 404, it stays usable by <img crossorigin> (LiquidGlass), and it avoids
  * opaque-response quota padding. Hosts without CORS fall back to a plain uncached fetch.

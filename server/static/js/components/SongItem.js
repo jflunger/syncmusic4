@@ -323,7 +323,9 @@ class SongItem extends HTMLElement {
   }
 
   get membershipEnabled() {
-    return !this.hasAttribute('no-swipe') && !!this.workingPlaylist;
+    const wp = this.workingPlaylist;
+    // Orphans is maintained by the server, so its membership can't be swiped.
+    return !this.hasAttribute('no-swipe') && !!wp && wp.kind !== 'orphans';
   }
 
   /** True when this row's track is the one currently loaded in the player. */

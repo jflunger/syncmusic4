@@ -14,6 +14,12 @@
  * `duration`); the store stays the source of truth and the UI re-renders from it. The
  * controller never reaches into the DOM.
  *
+ * Positions are CLIP-relative. A track with a custom start_time/end_time is, to everything
+ * outside this file, a track that starts at start_time and ends at end_time: the store's
+ * `currentTime` runs 0..`duration` across that window, seekTo() takes a time in the same
+ * frame, and the OS scrubber gets the same numbers. Only the audio elements (and the
+ * persisted resume point) deal in raw file time — see clipStart/clipEnd/publishPosition.
+ *
  * Usage:
  *   import playback from './services/PlaybackController.js';
  *   playback.toggle();            // play/pause
@@ -88,9 +94,65 @@ class PlaybackController {
     // this subscriber is the ONE place that pushes changes to the media session. Metadata is
     // refreshed only when the track changes; the play/pause transport only when isPlaying flips.
     appState.subscribe((key) => {
-      if (key === 'currentSong') this.updateMediaMetadata();
-      else if (key === 'isPlaying') this.updatePlaybackState();
+      if (key === 'currentSong') {
+        // A new track, or the current one re-trimmed in the editor: re-frame the scrubber.
+        this.publishPosition();
+        this.updateMediaMetadata();
+      } else if (key === 'isPlaying') this.updatePlaybackState();
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Clip window — the custom start/end points ARE the track's start and end.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * File time (seconds) where the current track's clip begins.
+   * @param {Object|null} [song] - defaults to the current song
+   * @returns {number}
+   */
+  clipStart(song = appState.get('currentSong')) {
+    return Math.max(0, song?.start_time ?? 0);
+  }
+
+  /**
+   * File time (seconds) where the current track's clip ends: end_time, capped at the file's
+   * real length. NaN until the active element knows its duration (and no end_time is set).
+   * @param {Object|null} [song] - defaults to the current song
+   * @param {HTMLAudioElement} [el] - defaults to the active element
+   * @returns {number}
+   */
+  clipEnd(song = appState.get('currentSong'), el = this.audioElement) {
+    const fileDur = el.duration;
+    const known = isFinite(fileDur) && fileDur > 0;
+    const end = song?.end_time;
+    if (end != null && end > this.clipStart(song)) return known ? Math.min(end, fileDur) : end;
+    return known ? fileDur : NaN;
+  }
+
+  /**
+   * Length of the current clip in seconds (0 while unknown).
+   * @returns {number}
+   */
+  clipDuration() {
+    const len = this.clipEnd() - this.clipStart();
+    return isFinite(len) && len > 0 ? len : 0;
+  }
+
+  /**
+   * Publish the active element's position and the clip length to the store, both relative
+   * to the clip start and clamped to the clip, so the scrubber's ends are the track's ends.
+   */
+  publishPosition() {
+    if (!appState.get('currentSong')) {
+      appState.set('duration', 0);
+      appState.set('currentTime', 0);
+      return;
+    }
+    const dur = this.clipDuration();
+    const pos = this.audioElement.currentTime - this.clipStart();
+    appState.set('duration', dur);
+    appState.set('currentTime', Math.max(0, Math.min(pos || 0, dur)));
   }
 
   /**
@@ -201,14 +263,16 @@ class PlaybackController {
       const el = this.audioElement; // capture: a later swap can reassign this.audioElement
       if (el.readyState >= 1) {
         el.currentTime = startTime;
-        appState.set('currentTime', startTime);
       } else {
         el.addEventListener('loadedmetadata', () => {
           el.currentTime = startTime;
-          if (el === this.audioElement) appState.set('currentTime', startTime);
+          if (el === this.audioElement) this.publishPosition();
         }, { once: true });
       }
     }
+    // A swapped-in element loaded its metadata while idle, so 'loadedmetadata' never reached
+    // the store for it — publish this track's clip now or the scrubber keeps the old length.
+    this.publishPosition();
 
     const started = this.audioElement;
     const p = started.play();
@@ -284,13 +348,15 @@ class PlaybackController {
   }
 
   /**
-   * Seek the active element to a position (seconds) and publish it.
-   * @param {number} time
+   * Seek the active element to a clip-relative position (seconds) and publish it.
+   * @param {number} time - 0 is the clip start; clamped to the clip.
    */
   seekTo(time) {
     if (!appState.get('currentSong')) return;
-    this.audioElement.currentTime = time;
-    appState.set('currentTime', time);
+    const dur = this.clipDuration();
+    const rel = Math.max(0, dur ? Math.min(time, dur) : time);
+    this.audioElement.currentTime = this.clipStart() + rel;
+    this.publishPosition();
     this.updatePositionState();
   }
 
@@ -350,24 +416,28 @@ class PlaybackController {
         return;
       }
       const ct = el.currentTime;
-      appState.set('currentTime', ct);
+      this.publishPosition();
       this.trackListenProgress(ct);
       this.updatePositionState();
       this.persist();
-      // Stop and advance when reaching a custom end_time.
+      // Stop and advance at the clip end (a custom end_time; the file's own end fires 'ended').
       const song = appState.get('currentSong');
-      if (song?.end_time != null && ct >= song.end_time) {
+      if (song?.end_time != null && ct >= this.clipEnd(song, el)) {
         this.beginAdvance();   // same transition as 'ended': don't report "paused" to the OS
         el.pause();
         this.next();
       }
     });
 
-    el.addEventListener('loadedmetadata', () => {
+    // 'durationchange' too: VBR files often refine their length after the first estimate,
+    // and a stale estimate is how playback runs on past the end of the scrubber.
+    const onDuration = () => {
       if (!isActive()) return;
-      appState.set('duration', el.duration);
+      this.publishPosition();
       this.updatePositionState();
-    });
+    };
+    el.addEventListener('loadedmetadata', onDuration);
+    el.addEventListener('durationchange', onDuration);
 
     // iOS only honors media-session action handlers when they're first registered while audio is
     // actively playing (setting them up front, before any playback, is silently ignored). So we
@@ -539,9 +609,10 @@ class PlaybackController {
     if (start > 0) {
       el.addEventListener('loadedmetadata', () => {
         el.currentTime = start;
-        if (el === this.audioElement) appState.set('currentTime', start);
+        if (el === this.audioElement) this.publishPosition();
       }, { once: true });
     }
+    this.publishPosition();
     const p = el.play();
     if (p && typeof p.catch === 'function') {
       p.catch((err) => console.warn('Fallback play() also rejected:', err?.name || err));
@@ -604,14 +675,18 @@ class PlaybackController {
     const { song, position } = this.pickResumePoint(saved);
     if (!song || !song.url) return;
 
-    appState.set('currentSong', song);
     this.audioElement.src = song.url;
+    appState.set('currentSong', song);
 
-    const seekTarget = position || song.start_time || 0;
+    // The saved position is raw file time. One outside the clip (the track was re-trimmed
+    // since) resumes from the clip start instead.
+    const start = this.clipStart(song);
+    const end = song.end_time ?? Infinity;
+    const seekTarget = position >= start && position < end ? position : start;
     if (seekTarget > 0) {
       const seek = () => {
         this.audioElement.currentTime = seekTarget;
-        appState.set('currentTime', seekTarget);
+        this.publishPosition();
       };
       if (this.audioElement.readyState >= 1) seek();
       else this.audioElement.addEventListener('loadedmetadata', seek, { once: true });
@@ -729,11 +804,14 @@ class PlaybackController {
     ms.setActionHandler('previoustrack', () => this.previous());
     ms.setActionHandler('nexttrack', () => this.next());
 
+    // The OS scrubber is clip-relative too (see updatePositionState).
     ms.setActionHandler('seekto', (details) => {
       if (details.seekTime == null) return;
       if (details.fastSeek && 'fastSeek' in this.audioElement) {
-        this.audioElement.fastSeek(details.seekTime);
-        appState.set('currentTime', details.seekTime);
+        const dur = this.clipDuration();
+        const rel = Math.max(0, dur ? Math.min(details.seekTime, dur) : details.seekTime);
+        this.audioElement.fastSeek(this.clipStart() + rel);
+        this.publishPosition();
         this.updatePositionState();
         return;
       }
@@ -793,17 +871,17 @@ class PlaybackController {
 
   /**
    * Publish playback position/duration so the lock-screen scrubber renders and tracks progress.
-   * Skipped until a finite duration is known (live/seeking states throw).
+   * Clip-relative, like the in-app scrubber. Skipped until the length is known.
    */
   updatePositionState() {
     if (!('mediaSession' in navigator) || !('setPositionState' in navigator.mediaSession)) return;
-    const dur = this.audioElement.duration;
-    if (!dur || !isFinite(dur)) return;
+    const dur = this.clipDuration();
+    if (!dur) return;
     try {
       navigator.mediaSession.setPositionState({
         duration: dur,
         playbackRate: this.audioElement.playbackRate || 1,
-        position: Math.min(Math.max(0, this.audioElement.currentTime), dur),
+        position: Math.min(Math.max(0, this.audioElement.currentTime - this.clipStart()), dur),
       });
     } catch (_) {
       // setPositionState throws if position > duration mid-transition; ignore.

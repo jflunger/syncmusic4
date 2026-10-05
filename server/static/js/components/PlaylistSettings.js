@@ -94,6 +94,8 @@ class PlaylistSettings extends HTMLElement {
 
   render() {
     const p = this.playlist || {};
+    // Orphans is filled automatically: no feeders, sync or delete.
+    const hideIfAuto = p.kind === 'orphans' ? 'style="display:none"' : '';
     const name = (p.name || '').replace(/"/g, '&quot;');
     const desc = (p.description || '').replace(/"/g, '&quot;');
     const iconUrl = (p.icon || '').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -586,13 +588,13 @@ class PlaylistSettings extends HTMLElement {
               </div>
               <div class="info-actions">
                 <button class="save-info-btn" id="save-info-btn">Save Changes</button>
-                <button class="delete-playlist-btn" id="delete-playlist-btn">Delete</button>
+                <button class="delete-playlist-btn" id="delete-playlist-btn" ${hideIfAuto}>Delete</button>
               </div>
             </div>
           </div>
 
           <!-- Section 2: Feeders -->
-          <div class="section">
+          <div class="section" ${hideIfAuto}>
             <div class="section-title">Feeder Playlists</div>
             <div id="feeders-container">
               <div class="feeder-loading">Loading...</div>
@@ -600,7 +602,7 @@ class PlaylistSettings extends HTMLElement {
           </div>
 
           <!-- Section 3: Sync -->
-          <div class="section">
+          <div class="section" ${hideIfAuto}>
             <div class="section-title">Sync</div>
             <div id="sync-button-container">
               <button class="sync-btn" id="sync-btn" disabled>Sync Now</button>

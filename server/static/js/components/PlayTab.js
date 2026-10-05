@@ -8,9 +8,15 @@ import appState from '../state/appState.js';
 import './LiquidGlass.js';
 import './PlaylistItem.js';
 
-// Movement (px) before a scrub gesture locks its axis. Below this we don't know yet
-// whether the finger is scrubbing (horizontal) or scrolling the page (vertical).
-const SCRUB_AXIS_LOCK = 6;
+// Fine scrubbing: dragging the finger down below the scrub slab slows the scrub, like
+// iOS. Bands by px below the grab point: [max dy, rate, label]. The page never scrolls
+// from the scrubber, so vertical movement is free to mean "sensitivity".
+const SCRUB_SPEEDS = [
+  [40, 1, ''],
+  [100, 0.5, 'Half speed'],
+  [160, 0.25, 'Quarter speed'],
+  [Infinity, 0.1, 'Fine scrubbing'],
+];
 
 // Pull-to-reveal: dragging down from the top of the page fades out everything drawn
 // over the cover (controls + bottom fade) instead of scrolling. Fully revealed after
@@ -32,14 +38,13 @@ class PlayTab extends HTMLElement {
     this.playFeeders = [];  // playlist ids drawn from when the queue empties
     this.playlists = [];    // full playlist data, looked up by feeder id for rendering
 
-    // Drag state. A scrub doesn't commit to "I'm a drag" until the finger has moved
-    // enough to lock the axis to horizontal — a vertical move releases the gesture so the
-    // page scrolls (the scrub strip is full-width, so swipes routinely begin on it).
+    // Drag state. A scrub owns its gesture from the first touch (touch-action: none):
+    // horizontal movement moves the position, scaled by a rate that drops as the finger
+    // goes down (SCRUB_SPEEDS), so it's integrated from the last X rather than absolute.
     this.isDragging = false;
     this.dragPosition = 0;
     this.progressRect = null;
-    this.scrubAxis = null; // null until locked, then 'x' (scrub) or 'y' (scroll)
-    this.scrubStartX = 0;
+    this.scrubLastX = 0;
     this.scrubStartY = 0;
 
     // History list expanded state
@@ -49,7 +54,7 @@ class PlayTab extends HTMLElement {
     // scrubber drags identically on desktop and mobile.
     this.boundPointerMove = this.handleProgressPointerMove.bind(this);
     this.boundPointerUp = this.handleProgressPointerUp.bind(this);
-    // A cancel (browser claimed the gesture for scrolling) must abort the scrub WITHOUT
+    // A cancel (a system gesture took over) must abort the scrub WITHOUT
     // emitting a seek, unlike a normal pointerup.
     this.boundPointerCancel = this.handleProgressPointerCancel.bind(this);
 
@@ -65,6 +70,61 @@ class PlayTab extends HTMLElement {
     this.render();
     this.attachEvents();
     this.loadState();
+    this.attachPin();
+  }
+
+  /**
+   * Keep the title slab fixed on screen like a top bar. It lives in .pin-layer, a
+   * position:fixed box laid over where the cover sits at scroll 0 (so the browser
+   * pins it natively — no scroll-linked JS). The box's place is measured here and set
+   * on the host as --pin-top/left/width, re-measured whenever this tab resizes (which
+   * includes becoming visible).
+   */
+  attachPin() {
+    this.pinScroller = this.getScrollParent();
+    this.pinObserver = new ResizeObserver(() => this.measurePin());
+    this.pinObserver.observe(this);
+    if (this.pinScroller) {
+      this.boundFadeScroll = () => this.fadeControls();
+      this.pinScroller.addEventListener('scroll', this.boundFadeScroll, { passive: true });
+    }
+  }
+
+  /**
+   * Fade the transport buttons and scrubber out as the page scrolls them up under the
+   * pinned title slab: each is fully transparent (and stops taking taps) by the time
+   * its top reaches the slab's middle. Set on the host as vars/classes so re-renders
+   * keep it. Only opacity is scroll-linked — position stays native, so no iOS lag.
+   */
+  fadeControls() {
+    const slot = this.shadowRoot.querySelector('.title-slot');
+    const play = this.shadowRoot.querySelector('.glass-play');
+    const scrub = this.shadowRoot.querySelector('.scrub-slab');
+    if (!slot || !play || !scrub || !this.pinScroller) return;
+    const scrollTop = Math.max(0, this.pinScroller.scrollTop);
+    const fadeAt = slot.offsetTop + slot.offsetHeight / 2;
+    const fade = (el) => Math.max(0, Math.min(1, 1 - scrollTop / Math.max(1, el.offsetTop - fadeAt)));
+    const btns = fade(play);
+    const scrubber = fade(scrub);
+    this.style.setProperty('--fade-btns', btns.toFixed(3));
+    this.style.setProperty('--fade-scrub', scrubber.toFixed(3));
+    this.classList.toggle('btns-gone', btns < 0.1);
+    this.classList.toggle('scrub-gone', scrubber < 0.1);
+  }
+
+  /** Measure the cover's scroll-0 viewport box for the fixed pin layer. */
+  measurePin() {
+    const hero = this.shadowRoot.querySelector('.cover-hero');
+    if (!hero) return;
+    const r = hero.getBoundingClientRect();
+    // No rubber-band in the (shared) scroller while this tab shows: reaching the top
+    // hands the gesture to pull-to-reveal instead of bouncing (see handleRevealMove).
+    if (this.pinScroller) this.pinScroller.style.overscrollBehaviorY = r.width ? 'none' : '';
+    if (!r.width) return; // tab hidden
+    const scrollTop = this.pinScroller ? this.pinScroller.scrollTop : 0;
+    this.style.setProperty('--pin-top', `${r.top + scrollTop}px`);
+    this.style.setProperty('--pin-left', `${r.left}px`);
+    this.style.setProperty('--pin-width', `${r.width}px`);
   }
 
   /**
@@ -186,7 +246,7 @@ class PlayTab extends HTMLElement {
     document.addEventListener('pointercancel', this.boundPointerCancel);
 
     // Pull-to-reveal. touchmove must be non-passive so a downward pull can cancel the
-    // page's scroll/rubber-band and drive the reveal instead.
+    // page's scroll and drive the reveal instead.
     this.addEventListener('touchstart', (e) => this.handleRevealStart(e), { passive: true });
     this.addEventListener('touchmove', (e) => this.handleRevealMove(e), { passive: false });
     this.addEventListener('touchend', () => this.handleRevealEnd());
@@ -212,37 +272,63 @@ class PlayTab extends HTMLElement {
    * @param {TouchEvent} e
    */
   handleRevealStart(e) {
+    cancelAnimationFrame(this._momentumRaf);
     if (e.touches.length !== 1) { this.revealMode = 'pass'; return; }
     cancelAnimationFrame(this._revealRaf);
     this.revealMode = null;
-    this.revealStartY = e.touches[0].clientY;
+    this.revealStartY = this.revealLastY = e.touches[0].clientY;
+    this.revealSamples = [];
   }
 
   /**
-   * On the first move decide pull vs. scroll; while pulling, block the scroll and map
-   * pull distance to reveal amount.
+   * One gesture flows between scrolling and revealing:
+   * - 'scroll': native scrolling. If it reaches the top while the finger keeps moving
+   *   down, it becomes a pull from that point instead of overscrolling.
+   * - 'pull': the finger's distance below the pull origin maps to reveal amount. Moving
+   *   back above the origin scrolls the page with the finger (we drive scrollTop, since
+   *   the gesture's native scroll was cancelled), with momentum on release.
+   * revealNative marks a pull entered mid-scroll whose touchmoves can't be cancelled
+   * (iOS): the browser keeps scrolling it, so we only drive the reveal.
    * @param {TouchEvent} e
    */
   handleRevealMove(e) {
     if (this.revealMode === 'pass' || this.isDragging) return;
-    const dy = e.touches[0].clientY - this.revealStartY;
+    const y = e.touches[0].clientY;
+    const scroller = this.pinScroller;
+    const atTop = !scroller || scroller.scrollTop <= 0;
+    const movingDown = y > this.revealLastY;
+    this.revealLastY = y;
+
     if (this.revealMode === null) {
-      if (dy === 0) return;
-      const scroller = this.getScrollParent();
-      const atTop = !scroller || scroller.scrollTop <= 0;
-      this.revealMode = dy > 0 && atTop ? 'pull' : 'pass';
-      if (this.revealMode === 'pass') return;
+      if (y === this.revealStartY) return;
+      this.revealMode = movingDown && atTop ? 'pull' : 'scroll';
+      this.revealNative = false;
+    } else if (this.revealMode === 'scroll' && atTop && movingDown) {
+      this.revealMode = 'pull';
+      this.revealStartY = y;
+      this.revealNative = !e.cancelable;
     }
-    if (e.cancelable) e.preventDefault();
+    if (this.revealMode !== 'pull') return;
+
+    if (!this.revealNative && e.cancelable) e.preventDefault();
+    const dy = y - this.revealStartY;
     this.setReveal(Math.min(1, Math.max(0, dy / REVEAL_DISTANCE)));
+    if (this.revealNative || !scroller) return;
+    scroller.scrollTop = Math.max(0, -dy);
+    const now = performance.now();
+    this.revealSamples.push({ t: now, y });
+    while (this.revealSamples.length > 2 && now - this.revealSamples[0].t > 100) this.revealSamples.shift();
   }
 
   /**
-   * Finger lifted: fade the covering elements back in.
+   * Finger lifted: fade the covering elements back in, and if the pull turned into a
+   * scroll we were driving, carry on with momentum.
    */
   handleRevealEnd() {
-    if (this.revealMode !== 'pull') { this.revealMode = null; return; }
+    const wasDriving = this.revealMode === 'pull' && !this.revealNative;
     this.revealMode = null;
+    if (wasDriving) this.startMomentum();
+    if (this.revealAmount <= 0) return;
     const from = this.revealAmount;
     const start = performance.now();
     const step = (now) => {
@@ -251,6 +337,32 @@ class PlayTab extends HTMLElement {
       if (t < 1) this._revealRaf = requestAnimationFrame(step);
     };
     this._revealRaf = requestAnimationFrame(step);
+  }
+
+  /**
+   * Fling the scroller with the finger's release velocity, decaying like iOS
+   * (0.998/ms). Stopped by the next touch.
+   */
+  startMomentum() {
+    const samples = this.revealSamples || [];
+    const scroller = this.pinScroller;
+    if (!scroller || samples.length < 2 || scroller.scrollTop <= 0) return;
+    const first = samples[0];
+    const last = samples[samples.length - 1];
+    if (performance.now() - last.t > 60) return; // finger paused before lifting
+    let v = -(last.y - first.y) / Math.max(1, last.t - first.t); // px/ms of scroll
+    let prev = performance.now();
+    const step = (now) => {
+      const dt = now - prev;
+      prev = now;
+      const before = scroller.scrollTop;
+      scroller.scrollTop = before + v * dt;
+      v *= Math.pow(0.998, dt);
+      if (Math.abs(v) > 0.02 && scroller.scrollTop !== before) {
+        this._momentumRaf = requestAnimationFrame(step);
+      }
+    };
+    this._momentumRaf = requestAnimationFrame(step);
   }
 
   /**
@@ -310,22 +422,54 @@ class PlayTab extends HTMLElement {
           justify-content: center;
         }
         .cover-hero.has-cover .cover-placeholder { display: none; }
-        .control-buttons {
-          position: absolute;
-          inset: 0;
-          display: flex;
-          align-items: center;
+        /* Overlay stacking title slab, controls and scrubber slab on the cover. It's a
+           grid (not nested flex rows) so every <liquid-glass> is a direct child of a box
+           the size of the cover — the glass maps the cover image against its parent.
+           .pin-layer repeats the same grid (with placeholders) so its title slab lands
+           exactly on the title slot here. */
+        .hero-stack, .pin-layer {
+          display: grid;
+          grid-template-columns: 26% 36% 26%;
+          column-gap: 2%;
+          row-gap: 3%;
           justify-content: center;
-          gap: 2%;
-          z-index: 1;
-          /* Pull-to-reveal fades the controls out with the bottom fade. */
+          align-content: center;
+          /* Pull-to-reveal fades the overlay out with the bottom fade. */
           opacity: calc(1 - var(--reveal, 0));
         }
+        .hero-stack {
+          position: absolute;
+          inset: 0;
+          z-index: 1;
+        }
+        /* Fixed, cover-sized box over the cover's scroll-0 spot (see measurePin). Only
+           the title slab inside is visible; it stays put while the page scrolls under it.
+           Above the list (song items use z-index up to 3); not interactive, so taps fall
+           through to whatever scrolls beneath. */
+        .pin-layer {
+          position: fixed;
+          top: var(--pin-top, 0px);
+          left: var(--pin-left, 0px);
+          width: var(--pin-width, 100%);
+          height: var(--pin-width, 100vw);
+          z-index: 5;
+          pointer-events: none;
+        }
+        /* Placeholders keeping both grids' rows identical: the title slot in the hero,
+           the button row and scrubber row in the pin layer. */
+        .title-slot { grid-column: 1 / -1; height: var(--slab-h); }
+        .button-slot { grid-column: 2; aspect-ratio: 1; }
+        .scrub-slot { grid-column: 1 / -1; height: 56px; }
         /* The glass is the icon: big icon-shaped glass, sized off the cover width. */
-        .control-buttons liquid-glass { aspect-ratio: 1; width: 26%; }
-        .control-buttons .glass-play { width: 36%; }
+        .hero-stack .glass-btn {
+          aspect-ratio: 1; width: 100%; align-self: center;
+          /* Scrolled away under the pinned title slab (see fadeControls). */
+          opacity: var(--fade-btns, 1);
+        }
+        .hero-stack .scrub-slab { opacity: var(--fade-scrub, 1); }
+        :host(.btns-gone) .glass-btn, :host(.scrub-gone) .scrub-slab { pointer-events: none; }
         /* Invisible hit target covering the whole glass. */
-        .control-buttons button {
+        .hero-stack .glass-btn button {
           background: none;
           border: none;
           padding: 0;
@@ -334,25 +478,26 @@ class PlayTab extends HTMLElement {
           cursor: pointer;
           -webkit-tap-highlight-color: transparent;
         }
-        /* Title + artist on a frosted glass slab near the bottom of the cover. The slab
-           sizes to its text; it fades out with the controls on pull-to-reveal. */
-        .song-slab {
-          position: absolute;
-          left: 4%;
-          right: 4%;
-          bottom: 4%;
+        /* Title + artist (above the controls) and the scrubber (below) on frosted glass
+           slabs spanning the button row. Slabs size to their content's height. */
+        .song-slab, .scrub-slab {
+          grid-column: 1 / -1;
           display: block;
-          z-index: 1;
-          opacity: calc(1 - var(--reveal, 0));
         }
+        /* Fixed line heights give the title slab a known height (--slab-h), which its
+           placeholder in the hero grid must match. */
+        :host { --slab-h: 96px; }
         .song-info {
           color: #fff;
           text-align: center;
+          box-sizing: border-box;
+          height: var(--slab-h);
           padding: 22px 32px;
           text-shadow: 0 1px 4px rgba(0,0,0,0.35);
         }
         .song-title {
           font-size: 20px;
+          line-height: 26px;
           margin: 0 0 6px 0;
           white-space: nowrap;
           overflow: hidden;
@@ -360,27 +505,35 @@ class PlayTab extends HTMLElement {
         }
         .song-artist {
           color: rgba(255,255,255,0.75);
+          font-size: 16px;
+          line-height: 20px;
           margin: 0;
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
         }
         .progress-wrap {
-          /* Generous vertical padding makes the full strip a drag target — the bar
-             itself is only 4px tall, too thin to grab on touch. touch-action:pan-y lets
-             the browser keep vertical swipes as page scrolls (the strip spans the full
-             width, so scrolls routinely start here) while horizontal
-             drags are delivered to the scrubber. */
-          padding: 16px 20px;
+          /* The whole slab is the scrubber. touch-action:none: a gesture that starts
+             here never scrolls the page — dragging down instead slows the scrub. */
+          height: 56px;
+          cursor: pointer;
+          touch-action: none;
           display: flex;
           align-items: center;
           justify-content: center;
-          touch-action: pan-y;
         }
-        .progress { width: 100%; height: 4px; background: #333; border-radius: 2px; position: relative; cursor: pointer; touch-action: pan-y; }
-        .progress.dragging { cursor: grabbing; }
-        .progress.dragging .progress-bar { background: #8000FF; box-shadow: 0 0 4px rgba(128, 0, 255, 0.5); }
-        .progress-bar { height: 100%; background: #8000FF; border-radius: 2px; width: 0%; }
+        .progress-wrap.dragging { cursor: grabbing; }
+        /* Seek time + speed, shown while scrubbing. */
+        .scrub-label {
+          color: #fff;
+          font-size: 14px;
+          font-variant-numeric: tabular-nums;
+          text-shadow: 0 1px 4px rgba(0,0,0,0.5);
+          opacity: 0;
+          transition: opacity 120ms;
+          pointer-events: none;
+        }
+        .progress-wrap.dragging .scrub-label { opacity: 1; }
         .queue { margin-top: 40px; }
         .queue-title { color: #fff; font-size: 18px; margin-bottom: 20px; text-align: center; }
         /* Section header: centered title with a "Clear" affordance pinned to the right. */
@@ -444,29 +597,32 @@ class PlayTab extends HTMLElement {
           </svg>
         </div>
         <div class="cover-blur"></div>
-        <div class="control-buttons">
-          <liquid-glass class="glass-prev" shape="prev" src="${this.currentSong?.cover || ''}">
+        <div class="hero-stack">
+          <div class="title-slot"></div>
+          <liquid-glass class="glass-btn glass-prev" shape="prev" src="${this.currentSong?.cover || ''}">
             <button class="prev-btn" aria-label="Previous"></button>
           </liquid-glass>
-          <liquid-glass class="glass-play" shape="${this.isPlaying ? 'pause' : 'play'}" accent="#8000FF" src="${this.currentSong?.cover || ''}">
+          <liquid-glass class="glass-btn glass-play" shape="${this.isPlaying ? 'pause' : 'play'}" accent="#8000FF" src="${this.currentSong?.cover || ''}">
             <button class="play-pause-btn" aria-label="${this.isPlaying ? 'Pause' : 'Play'}"></button>
           </liquid-glass>
-          <liquid-glass class="glass-next" shape="next" src="${this.currentSong?.cover || ''}">
+          <liquid-glass class="glass-btn glass-next" shape="next" src="${this.currentSong?.cover || ''}">
             <button class="next-btn" aria-label="Next"></button>
           </liquid-glass>
+          <liquid-glass class="scrub-slab" shape="slab" blur="22" accent="#000000" fill-color="#8000FF" fill="${this.getProgressPercent() / 100}" src="${this.currentSong?.cover || ''}">
+            <div class="progress-wrap" role="slider" aria-label="Seek"><span class="scrub-label"></span></div>
+          </liquid-glass>
         </div>
+      </div>
+
+      <div class="pin-layer">
         <liquid-glass class="song-slab" shape="slab" blur="22" accent="#000000" src="${this.currentSong?.cover || ''}">
           <div class="song-info">
             <h2 class="song-title">${this.currentSong ? this.currentSong.title : 'No song selected'}</h2>
             <p class="song-artist">${this.currentSong ? this.currentSong.artist : 'Unknown artist'}</p>
           </div>
         </liquid-glass>
-      </div>
-
-      <div class="progress-wrap">
-        <div class="progress">
-          <div class="progress-bar" style="width: ${this.getProgressPercent()}%"></div>
-        </div>
+        <div class="button-slot"></div>
+        <div class="scrub-slot"></div>
       </div>
 
       <div class="history ${this.historyExpanded ? 'expanded' : ''}">
@@ -685,14 +841,12 @@ class PlayTab extends HTMLElement {
   }
 
   /**
-   * Update progress bar visual (used during dragging)
+   * Update the scrub slab's purple fill (the slab itself is the progress bar)
    * @param {number} percent - Progress percentage
    */
   updateProgressVisual(percent) {
-    const bar = this.shadowRoot.querySelector('.progress-bar');
-    if (bar) {
-      bar.style.width = `${percent}%`;
-    }
+    const slab = this.shadowRoot.querySelector('.scrub-slab');
+    if (slab) slab.setAttribute('fill', (percent / 100).toFixed(4));
   }
 
   /**
@@ -702,66 +856,75 @@ class PlayTab extends HTMLElement {
     // Don't update progress bar if currently dragging
     if (this.isDragging) return;
 
-    const bar = this.shadowRoot.querySelector('.progress-bar');
-    if (bar) {
-      bar.style.width = `${this.getProgressPercent()}%`;
-    }
+    this.updateProgressVisual(this.getProgressPercent());
   }
 
   /**
-   * Arm a scrub gesture (pointerdown). We DON'T preventDefault or mark a drag yet — the
-   * axis isn't locked, so a vertical swipe that begins here must still scroll the page.
-   * Measures against the thin .progress bar even though the pointerdown can land anywhere
-   * on the padded .progress-wrap strip.
+   * Start a scrub (pointerdown): jump to the finger and own the gesture.
+   * Measures against the glass outline of the scrub slab, which the shader insets from
+   * the element by 1/8 of its height on each side (SLAB_INSET in LiquidGlass).
    * @param {PointerEvent} event
    */
   handleProgressPointerDown(event) {
     if (!this.currentSong || !this.duration) return;
 
-    const progressBar = this.shadowRoot.querySelector('.progress');
-    if (!progressBar) return;
+    const slab = this.shadowRoot.querySelector('.scrub-slab');
+    if (!slab) return;
 
+    if (event.cancelable) event.preventDefault();
     this.isDragging = true;
-    this.scrubAxis = null;
-    this.scrubStartX = event.clientX;
+    this.scrubLastX = event.clientX;
     this.scrubStartY = event.clientY;
-    this.progressRect = progressBar.getBoundingClientRect();
-    // Position for the tap-to-seek case (release with no axis lock).
+    const rect = slab.getBoundingClientRect();
+    const inset = rect.height / 8;
+    this.progressRect = { left: rect.left + inset, width: rect.width - 2 * inset };
     this.dragPosition = this.positionFromEvent(event);
+    this.shadowRoot.querySelector('.progress-wrap')?.classList.add('dragging');
+    this.showScrub(SCRUB_SPEEDS[0]);
   }
 
   /**
-   * Track the finger/cursor during a scrub (pointermove). Locks the axis on first
-   * meaningful movement: horizontal becomes a scrub (we then preventDefault to own the
-   * gesture); vertical releases the drag so the browser scrolls the page.
+   * Track the finger/cursor during a scrub (pointermove). Horizontal movement advances
+   * the position at the speed picked by how far below the grab point the finger is.
    * @param {PointerEvent} event
    */
   handleProgressPointerMove(event) {
     if (!this.isDragging || !this.progressRect) return;
+    if (event.cancelable) event.preventDefault();
 
-    if (!this.scrubAxis) {
-      const dx = event.clientX - this.scrubStartX;
-      const dy = event.clientY - this.scrubStartY;
-      if (Math.abs(dx) < SCRUB_AXIS_LOCK && Math.abs(dy) < SCRUB_AXIS_LOCK) return;
-      if (Math.abs(dy) > Math.abs(dx)) {
-        // Vertical intent → it's a scroll. Bail; the page keeps scrolling untouched.
-        this.isDragging = false;
-        this.progressRect = null;
-        return;
-      }
-      this.scrubAxis = 'x';
-      this.shadowRoot.querySelector('.progress')?.classList.add('dragging');
-    }
-
-    if (event.cancelable) event.preventDefault(); // own the horizontal gesture
-    this.dragPosition = this.positionFromEvent(event);
-    this.updateProgressVisual(this.dragPosition * 100);
+    const below = event.clientY - this.scrubStartY;
+    const speed = SCRUB_SPEEDS.find(([maxDy]) => below < maxDy);
+    const dx = event.clientX - this.scrubLastX;
+    this.scrubLastX = event.clientX;
+    this.dragPosition = Math.max(0, Math.min(1, this.dragPosition + (dx / this.progressRect.width) * speed[1]));
+    this.showScrub(speed);
   }
 
   /**
-   * Finish a scrub (pointerup) and emit the seek. A tap with no axis lock lands here too,
-   * so tapping the bar seeks just like a drag-release; a gesture that locked to vertical
-   * has already released and won't reach here as a drag.
+   * Paint the drag position: slab fill plus the "time · speed" label.
+   * @param {Array} speed - SCRUB_SPEEDS entry in effect
+   */
+  showScrub(speed) {
+    this.updateProgressVisual(this.dragPosition * 100);
+    const label = this.shadowRoot.querySelector('.scrub-label');
+    if (!label) return;
+    const time = this.formatTime(this.dragPosition * this.duration);
+    label.textContent = speed[2] ? `${time} · ${speed[2]}` : time;
+  }
+
+  /**
+   * Format seconds as m:ss.
+   * @param {number} seconds
+   * @returns {string}
+   */
+  formatTime(seconds) {
+    const s = Math.floor(seconds);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  }
+
+  /**
+   * Finish a scrub (pointerup) and emit the seek. A plain tap lands here too, so
+   * tapping the slab seeks to that spot.
    */
   handleProgressPointerUp() {
     if (!this.isDragging) return;
@@ -776,8 +939,8 @@ class PlayTab extends HTMLElement {
   }
 
   /**
-   * Abort a scrub (pointercancel) — the browser took the gesture over for scrolling, so
-   * restore the bar to the real playback position and emit NO seek.
+   * Abort a scrub (pointercancel, e.g. a system gesture took over) — restore the bar to
+   * the real playback position and emit NO seek.
    */
   handleProgressPointerCancel() {
     if (!this.isDragging) return;
@@ -787,10 +950,8 @@ class PlayTab extends HTMLElement {
 
   /** Clear drag state and the dragging visual. */
   endScrub() {
-    const progressBar = this.shadowRoot.querySelector('.progress');
-    if (progressBar) progressBar.classList.remove('dragging');
+    this.shadowRoot.querySelector('.progress-wrap')?.classList.remove('dragging');
     this.isDragging = false;
-    this.scrubAxis = null;
     this.progressRect = null;
   }
 
@@ -808,6 +969,10 @@ class PlayTab extends HTMLElement {
     if (this.unsubscribeState) {
       this.unsubscribeState();
     }
+    if (this.pinObserver) this.pinObserver.disconnect();
+    if (this.pinScroller) this.pinScroller.style.overscrollBehaviorY = '';
+    cancelAnimationFrame(this._momentumRaf);
+    if (this.boundFadeScroll) this.pinScroller.removeEventListener('scroll', this.boundFadeScroll);
 
     // Clean up drag event listeners
     document.removeEventListener('pointermove', this.boundPointerMove);
