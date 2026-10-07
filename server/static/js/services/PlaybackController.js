@@ -28,6 +28,13 @@
  *   playback.playSong(song);      // play a specific library track now
  *   playback.seekTo(seconds);
  *   await playback.start();       // restore the resume point + register lifecycle flush
+ *
+ * Discover previews: a candidate track (not a library song) plays on a third element,
+ * `previewEl`, so it never touches the queue, history, resume point or `currentSong`. While a
+ * preview is the audible source the OS media controls describe and drive IT — its title and
+ * cover, play/pause, scrubber — and they hand back to the library track as soon as that plays.
+ *   playback.loadPreview(track);  // { title, artist, cover, audio_url } or null to clear
+ *   playback.togglePreview();     // pauses the library track; the lock screen follows
  */
 
 import appState from '../state/appState.js';
@@ -54,7 +61,12 @@ class PlaybackController {
     this.audioElement = new Audio();   // the active element (drives state + audible)
     this.preloadEl = new Audio();      // the idle element, buffering the resolved next track
     this.preloadEl.preload = 'auto';
+    this.previewEl = new Audio();      // discover candidate preview (see loadPreview)
+    this.previewEl.preload = 'auto';
     this.audioElement.volume = this.preloadEl.volume = appState.get('volume');
+
+    this._previewTrack = null;    // candidate loaded into previewEl
+    this._previewActive = false;  // the preview, not the library track, owns the OS media controls
 
     this._preloadedSong = null;   // song whose url is currently loaded into preloadEl
     this._suppressPreload = false; // guard so a mid-swap re-resolve doesn't clobber the buffered track
@@ -73,6 +85,7 @@ class PlaybackController {
 
     this.attachAudioListeners(this.audioElement);
     this.attachAudioListeners(this.preloadEl);
+    this.attachPreviewListeners();
     this.armAudioUnlock();
 
     // Another copy of the app on this device (e.g. the one iOS spun up on unlock) started
@@ -382,6 +395,7 @@ class PlaybackController {
     // the lock screen drift (showing play while paused and vice-versa).
     el.addEventListener('play', () => {
       if (!isActive()) return;
+      this.exitPreview();   // the library track is audible again: the OS controls follow it
       appState.set('isPlaying', true);
     });
 
@@ -482,6 +496,104 @@ class PlaybackController {
     this.endAdvance();
     this.audioElement.pause();
     this.preloadEl.pause();
+    this.previewEl.pause();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Discover preview — a candidate track on its own element, owning the OS controls while heard
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Load a discover candidate into the preview element (stopping any preview of a different
+   * track), or clear it with null. Does not start playback.
+   * @param {{title: string, artist: string, cover: string, audio_url: string}|null} track
+   */
+  loadPreview(track) {
+    const url = track?.audio_url || null;
+    this._previewTrack = url ? track : null;
+    if (url === this.previewEl.getAttribute('src')) return;
+    this.previewEl.pause();
+    if (url) {
+      this.previewEl.src = url;
+      if (this._previewActive) this.updateMediaMetadata();   // the next candidate, still paused
+    } else {
+      this.previewEl.removeAttribute('src');
+      this.previewEl.load();
+      this.exitPreview();
+    }
+  }
+
+  /** Play the loaded preview, pausing the library track; the OS controls switch to the preview. */
+  playPreview() {
+    if (!this._previewTrack) return;
+    ownership.claim();
+    this.enterPreview();
+    if (appState.get('isPlaying')) this.pause();
+    const p = this.previewEl.play();
+    if (p && typeof p.catch === 'function') {
+      p.catch((err) => console.warn('Preview play() rejected:', err?.name || err));
+    }
+  }
+
+  /** Pause the preview. It keeps the OS controls, so the lock screen can resume it. */
+  pausePreview() {
+    this.previewEl.pause();
+  }
+
+  /** Play/pause the loaded preview. */
+  togglePreview() {
+    if (this.previewEl.paused) this.playPreview();
+    else this.pausePreview();
+  }
+
+  /**
+   * Seek the preview to a position in seconds.
+   * @param {number} time
+   */
+  seekPreview(time) {
+    const dur = this.previewEl.duration;
+    if (!isFinite(dur) || !dur) return;
+    this.previewEl.currentTime = Math.max(0, Math.min(time, dur));
+    this.updatePositionState();
+  }
+
+  /** Hand the OS media controls to the preview (its metadata, transport and scrubber). */
+  enterPreview() {
+    if (this._previewActive) return;
+    this._previewActive = true;
+    this.updateMediaMetadata();
+  }
+
+  /** Stop the preview and hand the OS media controls back to the library track. */
+  exitPreview() {
+    if (!this._previewActive) return;
+    this._previewActive = false;
+    this.previewEl.pause();
+    this.updateMediaMetadata();
+  }
+
+  /**
+   * Mirror the preview element's state to the OS controls while it owns them. The DiscoverTab
+   * listens to the same element for its own progress bar and button.
+   */
+  attachPreviewListeners() {
+    const el = this.previewEl;
+    const sync = () => { if (this._previewActive) this.updatePlaybackState(); };
+    el.addEventListener('play', sync);
+    el.addEventListener('pause', sync);
+    el.addEventListener('ended', sync);
+    el.addEventListener('loadedmetadata', sync);
+    el.addEventListener('durationchange', sync);
+    el.addEventListener('playing', () => {
+      if (!this._previewActive) return;
+      this.setupMediaSession();   // a preview may be the first thing ever played (see 'playing' above)
+      this.updatePlaybackState();
+    });
+    el.addEventListener('timeupdate', () => {
+      if (!this._previewActive) return;
+      if (!ownership.isOwner()) { el.pause(); return; }
+      this.updatePositionState();
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -799,14 +911,24 @@ class PlaybackController {
     if (!('mediaSession' in navigator) || this._mediaHandlersSet) return;
     const ms = navigator.mediaSession;
 
-    ms.setActionHandler('play', () => this.play());
-    ms.setActionHandler('pause', () => this.pause());
-    ms.setActionHandler('previoustrack', () => this.previous());
-    ms.setActionHandler('nexttrack', () => this.next());
+    // While a discover preview owns the controls: play/pause/seek drive the preview, previous
+    // restarts it, and next leaves it and resumes the library track.
+    ms.setActionHandler('play', () => (this._previewActive ? this.playPreview() : this.play()));
+    ms.setActionHandler('pause', () => (this._previewActive ? this.pausePreview() : this.pause()));
+    ms.setActionHandler('previoustrack', () => {
+      if (this._previewActive) this.seekPreview(0);
+      else this.previous();
+    });
+    ms.setActionHandler('nexttrack', () => {
+      if (!this._previewActive) { this.next(); return; }
+      this.exitPreview();
+      this.play();
+    });
 
     // The OS scrubber is clip-relative too (see updatePositionState).
     ms.setActionHandler('seekto', (details) => {
       if (details.seekTime == null) return;
+      if (this._previewActive) { this.seekPreview(details.seekTime); return; }
       if (details.fastSeek && 'fastSeek' in this.audioElement) {
         const dur = this.clipDuration();
         const rel = Math.max(0, dur ? Math.min(details.seekTime, dur) : details.seekTime);
@@ -842,15 +964,15 @@ class PlaybackController {
    */
   updateMediaMetadata() {
     if (!('mediaSession' in navigator) || typeof MediaMetadata === 'undefined') return;
-    const song = appState.get('currentSong');
+    const song = this._previewActive ? this._previewTrack : appState.get('currentSong');
     if (!song) return;
+    // No `type` on the artwork: candidate covers are remote (SoundCloud/YouTube, jpg or webp)
+    // and a wrong type makes Android drop the image; the browser sniffs it instead.
     navigator.mediaSession.metadata = new MediaMetadata({
       title: song.title || 'Unknown',
       artist: song.artist || 'Unknown artist',
-      album: song.album || '',
-      artwork: song.cover
-        ? [{ src: song.cover, sizes: '512x512', type: 'image/jpeg' }]
-        : [],
+      album: this._previewActive ? 'Discover' : (song.album || ''),
+      artwork: song.cover ? [{ src: song.cover, sizes: '512x512' }] : [],
     });
     this.updatePlaybackState();
   }
@@ -864,7 +986,9 @@ class PlaybackController {
   updatePlaybackState() {
     if (!('mediaSession' in navigator)) return;
     // `_advancing` holds the OS at "playing" across a track change — see beginAdvance().
-    const playing = appState.get('isPlaying') || this._advancing;
+    const playing = this._previewActive
+      ? !this.previewEl.paused
+      : appState.get('isPlaying') || this._advancing;
     navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
     this.updatePositionState();
   }
@@ -875,6 +999,18 @@ class PlaybackController {
    */
   updatePositionState() {
     if (!('mediaSession' in navigator) || !('setPositionState' in navigator.mediaSession)) return;
+    if (this._previewActive) {
+      const el = this.previewEl;
+      if (!isFinite(el.duration) || !el.duration) return;
+      try {
+        navigator.mediaSession.setPositionState({
+          duration: el.duration,
+          playbackRate: el.playbackRate || 1,
+          position: Math.min(Math.max(0, el.currentTime), el.duration),
+        });
+      } catch (_) {}
+      return;
+    }
     const dur = this.clipDuration();
     if (!dur) return;
     try {

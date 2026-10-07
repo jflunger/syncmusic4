@@ -17,6 +17,7 @@ const initialState = {
     playFeeders: [], // Playlist ids to draw from at random when the queue is exhausted
     history: [], // History of previously played songs
     relatedUpdate: null, // Last 'related_updated' socket event: { song_id, status, count?, error? }
+    discoverUpdate: null, // Last 'discover_updated' socket event for any user: { owner }
     workingPlaylist: null, // The currently selected working playlist (used by song-item membership UI)
     evergreens: [], // Top suggestions ranked from the user's last 1000 listens (Curate → Tracks)
     currentUser: null // Logged-in username, or null when not authenticated
@@ -122,6 +123,10 @@ function initializeWebSocket() {
 
     socket.on('related_updated', (data) => {
       appState.set('relatedUpdate', data);
+    });
+
+    socket.on('discover_updated', (data) => {
+      appState.set('discoverUpdate', data);
     });
 
     socket.on('download_failed', (data) => {

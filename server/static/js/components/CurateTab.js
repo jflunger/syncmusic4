@@ -7,7 +7,7 @@
  */
 
 import appState from '../state/appState.js';
-import { fetchSongs, fetchPlaylists, fetchEvergreens } from '../services/api.js';
+import { fetchSongs, fetchPlaylists, fetchEvergreens, fetchRecentAdditions } from '../services/api.js';
 import queueManager from '../services/QueueManager.js';
 import './PlaylistSettings.js';
 
@@ -16,6 +16,9 @@ const GRID_SIZE = 25;
 // Long-press on a grid tile removes it from the queue; same timing/slop as <song-item>.
 const GRID_LONG_PRESS_MS = 500;
 const GRID_LONG_PRESS_SLOP = 15;
+// Recent additions at the top of the Tracks subtab: rows shown folded / unfolded.
+const RECENT_COLLAPSED = 5;
+const RECENT_LIMIT = 20;
 
 class CurateTab extends HTMLElement {
   constructor() {
@@ -25,6 +28,8 @@ class CurateTab extends HTMLElement {
     this.playlists = [];
     this.evergreens = []; // Top tracks from the user's listen history, shown when not searching
     this.evergreensPending = false; // A re-rank arrived while the user was reading the list
+    this.recentAdditions = []; // Newest liked / search-downloaded tracks, newest first
+    this.recentExpanded = false; // Recent additions unfolded past RECENT_COLLAPSED
     this.gridSongs = []; // Random sample of library tracks shown as cover tiles; kept until redrawn
     this.gridPress = null; // In-flight long-press on a grid tile: { tile, x, y, timer, fired }
     this.activeSubtab = 'tracks'; // 'tracks', 'playlists', or 'working'
@@ -39,6 +44,7 @@ class CurateTab extends HTMLElement {
     this.loadSongs();
     this.loadPlaylists();
     this.loadEvergreens();
+    this.loadRecentAdditions();
     this.attachEvents();
     this.attachGridPress();
     // Grid tiles carry the same queue/now-playing badge as track rows; patch them in
@@ -57,6 +63,9 @@ class CurateTab extends HTMLElement {
       if (key === 'songs') {
         this.songs = value;
         this.renderContent();
+        // The library is refetched whenever a download lands or a like is added,
+        // which is exactly when the recent additions can change.
+        this.loadRecentAdditions();
       }
     });
     // No queue subscription here: rebuilding the whole library list on every enqueue is
@@ -121,6 +130,16 @@ class CurateTab extends HTMLElement {
   }
 
   /**
+   * Fetch the user's recent additions (Discover likes and search/link downloads)
+   * and repaint that section if it is on screen.
+   */
+  async loadRecentAdditions() {
+    this.recentAdditions = await fetchRecentAdditions(RECENT_LIMIT);
+    const recentEl = this.shadowRoot.querySelector('.recent-section');
+    if (recentEl && !this.searchQuery) this.renderRecentAdditions(recentEl);
+  }
+
+  /**
    * True when the evergreen list is the one currently on screen.
    * @returns {boolean}
    */
@@ -146,6 +165,13 @@ class CurateTab extends HTMLElement {
       // Hand the current query over to the Discover tab to search online
       if (event.target.closest('.search-online-btn')) {
         this.searchOnline();
+        return;
+      }
+
+      // Fold / unfold the recent additions
+      if (event.target.closest('.recent-toggle')) {
+        this.recentExpanded = !this.recentExpanded;
+        this.renderRecentAdditions(this.shadowRoot.querySelector('.recent-section'));
         return;
       }
 
@@ -332,8 +358,8 @@ class CurateTab extends HTMLElement {
           color: #aaa;
         }
         .stats { font-size: 14px; color: #aaa; margin-top: 8px; }
-        .grid-section { margin-bottom: 20px; }
-        .grid-section[hidden] { display: none; }
+        .grid-section, .recent-section { margin-bottom: 20px; }
+        .grid-section[hidden], .recent-section[hidden] { display: none; }
         .grid-header {
           display: flex;
           align-items: center;
@@ -342,7 +368,7 @@ class CurateTab extends HTMLElement {
           font-size: 14px;
           color: #aaa;
         }
-        .grid-redraw {
+        .grid-redraw, .recent-toggle {
           display: flex;
           align-items: center;
           gap: 4px;
@@ -356,7 +382,7 @@ class CurateTab extends HTMLElement {
           cursor: pointer;
         }
         .grid-redraw svg { width: 14px; height: 14px; fill: currentColor; }
-        .grid-redraw:active { transform: scale(0.95); }
+        .grid-redraw:active, .recent-toggle:active { transform: scale(0.95); }
         .grid {
           display: grid;
           grid-template-columns: repeat(5, 1fr);
@@ -439,6 +465,7 @@ class CurateTab extends HTMLElement {
         }
         .search-online-btn:active { transform: scale(0.985); }
         .song-list { display: flex; flex-direction: column; gap: 0; margin-top: 20px; }
+        .recent-list { display: flex; flex-direction: column; gap: 0; }
         .playlist-list {
           display: flex;
           flex-direction: column;
@@ -545,20 +572,58 @@ class CurateTab extends HTMLElement {
           <input type="text" class="search-input" placeholder="Search tracks..."
                  value="${this.escapeHtml(this.searchQueryRaw)}">
         </div>
+        <div class="recent-section"></div>
         <div class="grid-section"></div>
         <div class="stats"></div>
         <div class="song-list"></div>
       `;
     }
 
+    const recentEl = container.querySelector('.recent-section');
     const gridEl = container.querySelector('.grid-section');
+    recentEl.hidden = !!this.searchQuery;
     gridEl.hidden = !!this.searchQuery;
     if (this.searchQuery) {
       this.renderTrackSearchResults(container);
     } else {
+      this.renderRecentAdditions(recentEl);
       this.renderGrid(gridEl);
       this.renderEvergreenList(container);
     }
+  }
+
+  /**
+   * Recent additions: the newest tracks the user liked in Discover or downloaded
+   * from search / a link, newest first. Folded to RECENT_COLLAPSED rows by default.
+   * @param {HTMLElement} recentEl - The .recent-section container
+   */
+  renderRecentAdditions(recentEl) {
+    if (!recentEl) return;
+    if (this.recentAdditions.length === 0) {
+      recentEl.innerHTML = '';
+      delete recentEl.dataset.key;
+      return;
+    }
+
+    const shown = this.recentExpanded
+      ? this.recentAdditions
+      : this.recentAdditions.slice(0, RECENT_COLLAPSED);
+    // Re-renders are frequent (every library update); only rebuild when the rows
+    // actually changed so the covers don't flash.
+    const key = `${this.recentExpanded}:${this.recentAdditions.map(song => song.id).join(',')}`;
+    if (recentEl.dataset.key === key) return;
+    recentEl.dataset.key = key;
+
+    const canToggle = this.recentAdditions.length > RECENT_COLLAPSED;
+    recentEl.innerHTML = `
+      <div class="grid-header">
+        <span>Recent additions</span>
+        ${canToggle ? `<button class="recent-toggle" type="button">
+          ${this.recentExpanded ? 'Show less' : 'Show more'}
+        </button>` : ''}
+      </div>
+      <div class="recent-list">${this.songRowsHtml(shown)}</div>
+    `;
   }
 
   /**

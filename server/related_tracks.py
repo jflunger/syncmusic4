@@ -326,6 +326,9 @@ class RelatedManager:
         self.stop_event = threading.Event()
         self.event_queue = queue.Queue()
         self.threads = []
+        # Called with the song id after every finished lookup (ok or failed),
+        # from the worker thread once the job no longer counts as active.
+        self.on_finished = None
 
     def start(self):
         """Start one worker thread per platform (idempotent)."""
@@ -403,6 +406,11 @@ class RelatedManager:
                 with self.lock:
                     self.active[source] = None
                 self.queues[source].task_done()
+            if self.on_finished:
+                try:
+                    self.on_finished(song_id)
+                except Exception as e:
+                    print(f'[Related] on_finished hook failed for song {song_id}: {e}')
             self.stop_event.wait(POLL_DELAY)
 
     def _run_job(self, source, song_id, url):

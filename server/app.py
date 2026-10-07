@@ -426,7 +426,69 @@ migrate_queue_per_account()
 import related_tracks
 _conn = get_db_connection()
 related_tracks.migrate_related_tables(_conn)
+import discover
+discover.migrate_discover_tables(_conn)
 _conn.close()
+
+def migrate_library_additions():
+    """
+    Create library_additions: one row per song a user added on purpose — liked in
+    Discover ('like') or downloaded from search / a pasted link ('download').
+    Feeder-sync downloads are not recorded. Drives the Recent additions list.
+
+    On first creation it is backfilled: likes from track_ratings (rated_at), and,
+    when there is a single account, the remaining songs that no sync item or
+    rating explains as downloads dated by their audio file's mtime.
+    """
+    conn = get_db_connection()
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'library_additions'"
+        ).fetchone()
+        if exists:
+            return
+        conn.execute('''
+            CREATE TABLE library_additions (
+                song_id INTEGER PRIMARY KEY,
+                owner TEXT NOT NULL,
+                via TEXT NOT NULL CHECK (via IN ('like', 'download')),
+                added_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (song_id) REFERENCES songs (id) ON DELETE CASCADE
+            )
+        ''')
+        conn.execute('CREATE INDEX idx_library_additions_owner ON library_additions (owner, added_at DESC)')
+
+        conn.execute('''
+            INSERT OR IGNORE INTO library_additions (song_id, owner, via, added_at)
+            SELECT s.id, r.owner, 'like', r.rated_at
+            FROM track_ratings r JOIN songs s ON s.download_link = r.url
+            WHERE r.rating = 'like'
+        ''')
+
+        owners = conn.execute(
+            'SELECT DISTINCT owner FROM playlists WHERE owner IS NOT NULL'
+        ).fetchall()
+        if len(owners) == 1:
+            rows = conn.execute('''
+                SELECT s.id, s.file_path FROM songs s
+                WHERE NOT EXISTS (SELECT 1 FROM sync_items i WHERE i.download_link = s.download_link)
+                  AND NOT EXISTS (SELECT 1 FROM track_ratings r WHERE r.url = s.download_link)
+            ''').fetchall()
+            for row in rows:
+                try:
+                    mtime = os.path.getmtime(row['file_path'])
+                except (OSError, TypeError):
+                    continue
+                added_at = datetime.fromtimestamp(mtime, timezone.utc).isoformat(timespec='seconds')
+                conn.execute(
+                    "INSERT OR IGNORE INTO library_additions (song_id, owner, via, added_at) VALUES (?, ?, 'download', ?)",
+                    (row['id'], owners[0]['owner'], added_at)
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+migrate_library_additions()
 
 # Initialize SocketIO
 # async_mode='threading' lets Socket.IO run under a plain WSGI server (waitress)
@@ -463,6 +525,12 @@ manager.fallback_manager = fallback_manager
 related_manager = related_tracks.RelatedManager(DB_PATH, socketio=socketio)
 
 AUDIO_DIR = os.path.join(app.root_path, 'static', 'audio')
+
+# Discover: one pre-downloaded candidate per user, drawn from the related tracks
+# of a random feeder song (see discover.py). Hooked into both worker pools.
+discover_manager = discover.DiscoverManager(DB_PATH, manager, related_manager)
+manager.discover = discover_manager
+related_manager.on_finished = discover_manager.on_related_finished
 
 @app.route('/')
 def index():
@@ -736,6 +804,7 @@ def delete_song(song_id):
         cursor.execute('DELETE FROM songs WHERE id = ?', (song_id,))
         cursor.execute('DELETE FROM related_tracks WHERE song_id = ?', (song_id,))
         cursor.execute('DELETE FROM related_fetches WHERE song_id = ?', (song_id,))
+        cursor.execute('DELETE FROM library_additions WHERE song_id = ?', (song_id,))
         conn.commit()
 
         # Remove audio file from disk if it exists
@@ -1957,6 +2026,41 @@ def get_song_related(song_id):
         'results': [{**r, 'library_song_id': library.get(r['url'])} for r in results],
     })
 
+@app.route('/api/discover')
+def get_discover():
+    """
+    The user's current discover candidate, drawing one if there is none.
+
+    Returns:
+        JSON: { status: 'fetching_related'|'downloading'|'ready'|'error'|'empty',
+                error, seed: { id, title, artist, cover, source, related_job } | null,
+                track: { url, source, title, artist, cover, duration, metrics, audio_url } | null }
+        audio_url is set once status is 'ready'. Changes are announced with a
+        'discover_updated' WebSocket event ({ owner }).
+    """
+    return jsonify(discover_manager.get_state(current_user()))
+
+@app.route('/api/discover/rate', methods=['POST'])
+def rate_discover():
+    """
+    Rate the current candidate and draw the next one. 'like' adds it to the
+    library (it must be downloaded), 'dislike' deletes its file. The rating is
+    remembered so the track is never suggested again.
+
+    Request body: { url, rating: 'like'|'dislike' }
+    Returns: the new state (as GET /api/discover) plus added_song_id on a like.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        return jsonify(discover_manager.rate(current_user(), data.get('url'), data.get('rating')))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 409
+
+@app.route('/api/discover/redraw', methods=['POST'])
+def redraw_discover():
+    """Discard the current candidate without rating it and draw a new one."""
+    return jsonify(discover_manager.redraw(current_user()))
+
 @app.route('/api/download', methods=['POST'])
 def download_track():
     """
@@ -1988,7 +2092,10 @@ def download_track():
         'download_link': url,
         'title': track_data.get('title', 'Unknown'),
         'artist': track_data.get('artist', 'Unknown'),
-        'cover': track_data.get('cover')
+        'cover': track_data.get('cover'),
+        # Recorded in library_additions once the download lands
+        'added_by': current_user(),
+        'added_via': 'download'
     }
 
     # Add to download queue
@@ -2332,6 +2439,46 @@ def get_evergreens():
     finally:
         conn.close()
 
+@app.route('/api/recent-additions')
+def get_recent_additions():
+    """
+    The current user's newest library additions: tracks they liked in Discover
+    or downloaded from search / a link (feeder syncs are left out).
+
+    Query params:
+        limit: how many tracks to return (default 20, max 100)
+
+    Returns:
+        JSON {additions: [song, ...]}, newest first; each song carries the usual
+        client fields plus `via` ('like' or 'download') and `added_at` (ISO, UTC).
+    """
+    try:
+        limit = int(request.args.get('limit', 20))
+    except ValueError:
+        limit = 20
+    limit = max(1, min(limit, 100))
+
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(f'''
+            SELECT {_SONG_SELECT}, a.via, a.added_at
+            FROM library_additions a JOIN songs s ON s.id = a.song_id
+            WHERE a.owner = ?
+            ORDER BY a.added_at DESC, a.song_id DESC
+            LIMIT ?
+        ''', (current_user(), limit)).fetchall()
+        additions = []
+        for row in rows:
+            song = _song_row_to_client(row)
+            song['via'] = row['via']
+            song['added_at'] = row['added_at']
+            additions.append(song)
+        return jsonify({'additions': additions})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
 @app.route('/api/playback-state', methods=['GET'])
 def get_playback_state():
     """Return the current user's resume point: the loaded song (or null), the
@@ -2474,6 +2621,7 @@ def start_download_manager():
                     manager.process_events()
                     fallback_manager.process_events()
                     related_manager.process_events()
+                    discover_manager.process_events()
                     time.sleep(0.1)  # Process events every 100ms
                 except Exception as e:
                     print(f"Error processing events: {e}")

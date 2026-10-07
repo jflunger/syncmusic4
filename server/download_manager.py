@@ -14,6 +14,7 @@ import queue
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from typing import List, Dict, Any
 
 # A SoundCloud Go+ preview is ~30s. Any SoundCloud download shorter than this is
@@ -109,6 +110,10 @@ class DownloadManager:
 
         # Event queue for thread-safe communication with main thread
         self.event_queue = queue.Queue()
+
+        # DiscoverManager (set by app.py). Downloads flagged 'discover_owner' are
+        # discover candidates: their file is handed to it instead of the library.
+        self.discover = None
 
         # Ensure directories exist
         os.makedirs(self.downloads_path, exist_ok=True)
@@ -560,6 +565,9 @@ class DownloadManager:
         @param {str} file_path - Current file path
         @returns {str|None} - Final stored path (with song-id prefix), or None on conflict
         """
+        if song_data.get('discover_owner') and self.discover:
+            return self.discover.download_finished(song_data, file_path)
+
         conn = self.get_db_connection()
 
         try:
@@ -592,6 +600,12 @@ class DownloadManager:
                 )
 
                 song_id = cursor.lastrowid
+                if song_data.get('added_by') and song_data.get('added_via'):
+                    conn.execute(
+                        'INSERT OR REPLACE INTO library_additions (song_id, owner, via, added_at) VALUES (?, ?, ?, ?)',
+                        (song_id, song_data['added_by'], song_data['added_via'],
+                         datetime.now(timezone.utc).isoformat(timespec='seconds'))
+                    )
                 conn.commit()
 
             # Rename file to start with song ID, with special characters removed
@@ -776,7 +790,8 @@ class DownloadManager:
         @returns {bool} - True if the fallback accepted the track
         """
         fb = self.fallback_manager
-        if fb is None:
+        if fb is None or song_data.get('discover_owner'):
+            # Discover candidates stay out of the fallback: it would add them to the library.
             return False
         accepted = fb.add_download({
             'source': 'downcloud',
@@ -895,6 +910,12 @@ class DownloadManager:
                 song_data.pop('failure_reason', None)
                 print(f"Worker {platform}: Got song from queue: {song_data.get('title', 'Unknown')}")
 
+                # A discover candidate that was rated/redrawn while still queued.
+                if song_data.get('discover_owner') and self.discover and not self.discover.still_wanted(song_data):
+                    print(f"Worker {platform}: Skipping discarded discover candidate: {song_data.get('title', 'Unknown')}")
+                    self.queues[platform].task_done()
+                    continue
+
                 # Emit download started event
                 track_info = {
                     'url': song_data['download_link'],
@@ -955,6 +976,9 @@ class DownloadManager:
                     track_info['failure_reason'] = failure_reason
                 print(f"Worker {platform}: Emitting {event_type} for {track_info['title']}")
                 self._emit_event(event_type, track_info)
+
+                if not success and song_data.get('discover_owner') and self.discover:
+                    self.discover.download_failed(song_data, failure_reason)
 
                 if not success:
                     self._update_sync_item_status(song_data['download_link'], 'error')

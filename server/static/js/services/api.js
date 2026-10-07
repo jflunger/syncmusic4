@@ -420,6 +420,53 @@ async function fetchSongRelated(songId) {
 }
 
 /**
+ * POST/GET a discover endpoint and return its JSON, throwing the server's error message on failure.
+ * @param {string} path - e.g. '/api/discover'
+ * @param {Object} [body] - JSON body; sends a POST when given
+ * @returns {Promise<Object>}
+ */
+async function discoverRequest(path, body) {
+  const options = body === undefined ? {} : {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  };
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `HTTP error! status: ${response.status}`);
+  return data;
+}
+
+/**
+ * The user's current discover candidate (the server draws one if there is none).
+ * A 'discover_updated' socket event ({ owner }) follows every change.
+ * @returns {Promise<Object>} { status: 'fetching_related'|'downloading'|'ready'|'error'|'empty', error,
+ *   seed: { id, title, artist, cover, source, related_job } | null,
+ *   track: { url, source, title, artist, cover, duration, metrics, audio_url } | null }
+ */
+function fetchDiscover() {
+  return discoverRequest('/api/discover');
+}
+
+/**
+ * Rate the current candidate ('like' adds it to the library, 'dislike' deletes it) and draw the next.
+ * @param {string} url - The rated candidate's URL (rejected if it is no longer current)
+ * @param {'like'|'dislike'} rating
+ * @returns {Promise<Object>} The next candidate state, plus added_song_id on a like
+ */
+function rateDiscover(url, rating) {
+  return discoverRequest('/api/discover/rate', { url, rating });
+}
+
+/**
+ * Discard the current candidate without rating it and draw a new one.
+ * @returns {Promise<Object>} The new candidate state
+ */
+function redrawDiscover() {
+  return discoverRequest('/api/discover/redraw', {});
+}
+
+/**
  * Update a playlist's name and/or description
  * @param {number} playlistId
  * @param {Object} updates - { name?, description? }
@@ -705,6 +752,26 @@ async function logListen(songId, seconds) {
 }
 
 /**
+ * Fetch the user's newest library additions (Discover likes and search/link
+ * downloads), newest first.
+ * @param {number} limit - How many tracks to fetch
+ * @returns {Promise<Object[]>} Songs with extra `via` and `added_at` fields
+ */
+async function fetchRecentAdditions(limit = 20) {
+  try {
+    const response = await fetch(`/api/recent-additions?limit=${limit}`);
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    const data = await response.json();
+    return data.additions || [];
+  } catch (error) {
+    console.error('Error fetching recent additions:', error);
+    return [];
+  }
+}
+
+/**
  * Fetch the user's evergreens: songs ranked over their last 1000 listens.
  * @param {number} [limit=10] - How many tracks to return (the Tracks subtab shows this many)
  * @returns {Promise<Array>} Song objects, best first, each with `score` and `listens`
@@ -727,10 +794,10 @@ export {
   fetchSongs, createPlaylist, fetchPlaylists, downloadFromSpotify, searchSongs,
   downloadTrack, saveQueue, loadQueue, saveHistory, loadHistory, clearHistory,
   savePlaybackState, loadPlaybackState, addSongToPlaylist, removeSongFromPlaylist, updateSong, deleteSong,
-  redownloadSong, fetchSongRelated,
+  redownloadSong, fetchSongRelated, fetchDiscover, rateDiscover, redrawDiscover,
   updatePlaylist, deletePlaylist, uploadPlaylistIcon, usePlaylistFeederIcon, removePlaylistIcon,
   fetchFeeders, addFeeder, removeFeeder, triggerSync, fetchSyncStatus,
   fetchPlayFeeders, addPlayFeeder, removePlayFeeder,
   login, logout, getCurrentUser,
-  logListen, fetchEvergreens
+  logListen, fetchEvergreens, fetchRecentAdditions
 };
