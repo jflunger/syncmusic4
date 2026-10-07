@@ -11,7 +11,7 @@
  *  - Tap the queue indicator → remove from queue (emits 'remove-from-queue' { songId, index }).
  *  - Swipe right-to-left    → toggle membership of the working playlist
  *                             (emits 'add-to-playlist' or 'remove-from-playlist' { song }).
- *  - Long-press (library)   → edit (emits 'track-edit-request' { song }).
+ *  - Long-press (library)   → edit (emits 'track-edit-request' { song, origin }).
  *
  * Membership UI reads the working playlist from appState ('workingPlaylist'). A rotated
  * square of the playlist icon peeks in from the right as a triangle when the track is a
@@ -545,8 +545,10 @@ class SongItem extends HTMLElement {
       end_time: d.end_time ?? null
     };
 
+    // The editor grows out of (and shrinks back into) this row, like the Play tab's slab.
+    const radius = parseFloat(getComputedStyle(this).borderTopLeftRadius) || 0;
     this.dispatchEvent(new CustomEvent('track-edit-request', {
-      detail: { song }, bubbles: true, composed: true
+      detail: { song, origin: { el: this, inset: 0, radius } }, bubbles: true, composed: true
     }));
 
     setTimeout(() => { this.isLongPress = false; }, 0);

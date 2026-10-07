@@ -256,9 +256,10 @@ class MusicApp extends HTMLElement {
     this.addEventListener('feeder-remove', (e) => this.onFeederRemove(e.detail.playlistId));
 
     this.addEventListener('track-edit-request', (e) => {
-      const { song } = e.detail;
+      const { song, origin } = e.detail;
       const editor = document.createElement('track-editor');
       editor.setAttribute('song', JSON.stringify(song));
+      if (origin) editor.origin = origin;
       editor.addEventListener('saved', async (ev) => {
         const updatedSong = ev.detail.song;
         await this.loadSongs();
@@ -280,6 +281,10 @@ class MusicApp extends HTMLElement {
         }
       });
       editor.addEventListener('show-related', (ev) => this.showRelated(ev.detail.song));
+      editor.addEventListener('playlist-toggle', (ev) => {
+        const { playlistId, add, song: target } = ev.detail;
+        ev.detail.result = this.togglePlaylistMembership(add, target, playlistId);
+      });
       editor.addEventListener('close', () => {});
       this.shadowRoot.appendChild(editor);
     });
@@ -361,51 +366,57 @@ class MusicApp extends HTMLElement {
   }
 
   /**
-   * Add or remove a song from the working playlist and keep state in sync.
-   * Drives the song-item membership swipe across every tab.
+   * Add or remove a song from a playlist (the working playlist by default) and keep
+   * state in sync. Drives the song-item membership swipe across every tab and the track
+   * editor's playlist side.
    * @param {boolean} add - true to add, false to remove
    * @param {Object} song
+   * @param {number} [playlistId] - Defaults to the working playlist
+   * @returns {Promise<boolean|undefined>} true/false once done; undefined if nothing was done
    */
-  async togglePlaylistMembership(add, song) {
+  async togglePlaylistMembership(add, song, playlistId) {
     const wp = appState.get('workingPlaylist');
-    if (!wp || !song || song.id == null || this._togglingPlaylist) return;
+    const id = playlistId ?? wp?.id;
+    if (id == null || !song || song.id == null) return;
+    this._togglingPlaylists = this._togglingPlaylists || new Set();
+    if (this._togglingPlaylists.has(id)) return;
 
-    const playlists = appState.get('playlists') || [];
-    const current = playlists.find(p => p.id === wp.id);
-    const songs = (current?.songs) || wp.songs || [];
+    const current = (appState.get('playlists') || []).find(p => p.id === id);
+    const songs = (current?.songs) || (wp?.id === id ? wp.songs : null) || [];
     const alreadyIn = songs.some(s => String(s.id) === String(song.id));
     if (add === alreadyIn) return; // nothing to do (already in / already out)
 
-    this._togglingPlaylist = true;
+    this._togglingPlaylists.add(id);
     try {
       if (add) {
-        await addSongToPlaylist(wp.id, song.id);
+        await addSongToPlaylist(id, song.id);
       } else {
-        await removeSongFromPlaylist(wp.id, song.id);
+        await removeSongFromPlaylist(id, song.id);
       }
 
-      const updatedPlaylists = playlists.map(p => {
-        if (p.id !== wp.id) return p;
-        const list = Array.isArray(p.songs) ? [...p.songs] : [];
-        if (add) {
-          if (!list.some(s => String(s.id) === String(song.id))) list.push(song);
-        } else {
-          return { ...p, songs: list.filter(s => String(s.id) !== String(song.id)) };
-        }
+      // Re-read: another toggle may have updated playlists while this one awaited.
+      const updatedPlaylists = (appState.get('playlists') || []).map(p => {
+        if (p.id !== id) return p;
+        const list = Array.isArray(p.songs) ? p.songs.filter(s => String(s.id) !== String(song.id)) : [];
+        if (add) list.push(song);
         return { ...p, songs: list };
       });
 
       appState.set('playlists', updatedPlaylists);
-      const updatedWp = updatedPlaylists.find(p => p.id === wp.id);
-      appState.set('workingPlaylist', updatedWp ? { ...updatedWp } : wp);
+      if (wp?.id === id) {
+        const updatedWp = updatedPlaylists.find(p => p.id === id);
+        appState.set('workingPlaylist', updatedWp ? { ...updatedWp } : wp);
+      }
 
       // Membership changed, so the server-maintained Orphans playlist may have too.
       fetchPlaylists().then(fresh => { if (fresh) appState.set('playlists', fresh); });
+      return true;
     } catch (err) {
       console.error('Playlist toggle failed:', err);
       alert(add ? 'Failed to add song to playlist' : 'Failed to remove song from playlist');
+      return false;
     } finally {
-      this._togglingPlaylist = false;
+      this._togglingPlaylists.delete(id);
     }
   }
 

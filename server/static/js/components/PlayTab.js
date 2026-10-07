@@ -1,7 +1,8 @@
 /**
  * Play tab - Focused music player interface.
  * Usage: <play-tab></play-tab>
- * Emits: 'play-pause', 'next', 'previous', 'seek', 'enqueue-song', 'clear-queue', 'clear-history' events
+ * Emits: 'play-pause', 'next', 'previous', 'seek', 'enqueue-song', 'clear-queue', 'clear-history',
+ *        'track-edit-request' (tap the title slab; detail: { song, origin }) events
  */
 
 import appState from '../state/appState.js';
@@ -181,6 +182,17 @@ class PlayTab extends HTMLElement {
    * Attach event listeners
    */
   attachEvents() {
+    // Tap the title slab → open the track editor, grown out of the slab. The slab's
+    // pin layer ignores pointers (so the page scrolls under it), so hit-test the tap
+    // here, in the capture phase, before whatever lies beneath the slab acts on it.
+    this.shadowRoot.addEventListener('click', (event) => {
+      if (this.hitsSongSlab(event)) {
+        event.stopPropagation();
+        event.preventDefault();
+        this.openTrackEditor();
+      }
+    }, true);
+
     this.shadowRoot.addEventListener('click', (event) => {
       const target = event.target;
 
@@ -664,6 +676,44 @@ class PlayTab extends HTMLElement {
         (this.history || []).slice(0, 10)
       );
     });
+  }
+
+  /**
+   * Whether a pointer event landed on the title slab's visible glass.
+   * @param {MouseEvent} event
+   * @returns {boolean}
+   */
+  hitsSongSlab(event) {
+    const slab = this.shadowRoot.querySelector('.song-slab');
+    if (!slab || slab.style.visibility === 'hidden') return false;
+    const r = slab.getBoundingClientRect();
+    const inset = this.slabInset(r);
+    return event.clientX >= r.left + inset && event.clientX <= r.right - inset
+      && event.clientY >= r.top + inset && event.clientY <= r.bottom - inset;
+  }
+
+  /**
+   * The slab shader draws its glass inset from the element edge (room for the shadow):
+   * SLAB_INSET (0.25) shape units, a unit being half the short side; corners 0.45 units.
+   * @param {DOMRect} rect - The slab's bounding box
+   * @returns {number} inset in px
+   */
+  slabInset(rect) {
+    return 0.25 * Math.min(rect.width, rect.height) / 2;
+  }
+
+  /** Ask the app to open the track editor for the current song, growing out of the slab. */
+  openTrackEditor() {
+    const song = this.currentSong;
+    if (!song?.id) return;
+    const slab = this.shadowRoot.querySelector('.song-slab');
+    const rect = slab.getBoundingClientRect();
+    const unit = Math.min(rect.width, rect.height) / 2;
+    this.dispatchEvent(new CustomEvent('track-edit-request', {
+      detail: { song, origin: { el: slab, inset: this.slabInset(rect), radius: 0.45 * unit } },
+      bubbles: true,
+      composed: true
+    }));
   }
 
   /**

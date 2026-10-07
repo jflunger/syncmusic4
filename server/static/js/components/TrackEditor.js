@@ -1,9 +1,19 @@
 /**
- * Track editor modal - Edit song name, artist, start and end times.
- * Usage: <track-editor song="..."></track-editor>
+ * Track editor - full-page frosted sheet to edit a song's name, artist and clip
+ * (start/end), re-download it, show related tracks or delete it. Everything behind it
+ * is blurred. The button in the corner spins the card over (3D flip) to its back: the
+ * playlists (feeders first), where tapping one adds/removes the track. Given an `origin` element, the sheet grows out of that element's box and
+ * shrinks back into it on close (the element is hidden meanwhile, so it reads as the
+ * element itself expanding) — the Play tab uses this for its title slab.
+ * Usage: const ed = document.createElement('track-editor');
+ *        ed.setAttribute('song', JSON.stringify(song));
+ *        ed.origin = { el, inset, radius }; // optional: px inset of the visible box, corner radius
+ *        root.appendChild(ed);
  * Emits: 'close' when dismissed, 'saved' when save succeeds, 'deleted' when deleted,
  *        'redownload' when a re-download is queued (detail: { songId }),
- *        'show-related' when "Show related" is tapped (detail: { song })
+ *        'show-related' when "Show related" is tapped (detail: { song }),
+ *        'playlist-toggle' when a playlist is tapped on the back (detail: { playlistId, add, song,
+ *        result } — the handler sets result to a promise of the outcome)
  */
 
 import { updateSong, deleteSong, redownloadSong } from '../services/api.js';
@@ -11,6 +21,19 @@ import appState from '../state/appState.js';
 
 const MIN_GAP = 0.1;       // minimum seconds between start and end
 const PREVIEW_SECONDS = 3; // length of the start/end preview snippets
+const OPEN_MS = 420;       // sheet grow / shrink duration
+const EASE = 'cubic-bezier(0.2, 0.85, 0.25, 1)';
+const FLIP_MS = 760;       // card flip duration
+
+// Two arrows chasing round: "turn the card over".
+const FLIP_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+  <path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/>
+  <path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/></svg>`;
+const CHECK_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>`;
+const NOTE_ICON = `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg>`;
+
+/** Escape text for HTML. */
+const esc = (v) => String(v ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 class TrackEditor extends HTMLElement {
   constructor() {
@@ -18,10 +41,15 @@ class TrackEditor extends HTMLElement {
     this.attachShadow({ mode: 'open' });
 
     this.song = null;
+    this.origin = null; // { el, inset, radius } the sheet grows out of, if any
     this.duration = 0;
     this.startTime = 0;
     this.endTime = 0;
     this.isLoadingDuration = true;
+    this.closing = false;
+    this.flipped = false;  // showing the playlists side
+    this.flipping = false;
+    this.pendingToggles = new Map(); // playlistId -> membership we're waiting on
 
     // Slider drag state
     this.draggingThumb = null; // 'start' | 'end'
@@ -42,16 +70,24 @@ class TrackEditor extends HTMLElement {
   }
 
   attributeChangedCallback(name, oldVal, newVal) {
-    if (name === 'song' && newVal) {
-      try {
-        this.song = typeof newVal === 'string' ? JSON.parse(newVal) : newVal;
-        this.initFromSong();
-      } catch (e) {
-        this.song = null;
-      }
+    // Before connect, connectedCallback reads the attribute itself.
+    if (name === 'song' && newVal && this.isConnected) {
+      this.parseSong(newVal);
+      this.render();
+      this.initFromSong();
     }
   }
 
+  /** @param {string} json - The `song` attribute */
+  parseSong(json) {
+    try {
+      this.song = JSON.parse(json);
+    } catch (e) {
+      this.song = null;
+    }
+  }
+
+  /** Read the clip from the song and load the file's duration for the slider. */
   initFromSong() {
     if (!this.song) return;
 
@@ -61,6 +97,7 @@ class TrackEditor extends HTMLElement {
 
     if (this.song.url) {
       const audio = new Audio();
+      audio.preload = 'metadata';
       audio.addEventListener('loadedmetadata', () => {
         this.duration = audio.duration;
         if (this.endTime == null || this.endTime > this.duration) {
@@ -70,36 +107,39 @@ class TrackEditor extends HTMLElement {
           this.startTime = 0;
         }
         this.isLoadingDuration = false;
-        this.render();
+        this.renderClip();
       });
       audio.addEventListener('error', () => {
         this.duration = 300; // Fallback 5 min
+        if (this.endTime == null || this.endTime > this.duration) this.endTime = this.duration;
         this.isLoadingDuration = false;
-        this.render();
+        this.renderClip();
       });
       audio.src = this.song.url.startsWith('/') ? window.location.origin + this.song.url : this.song.url;
     } else {
       this.duration = 300;
+      if (this.endTime == null) this.endTime = this.duration;
       this.isLoadingDuration = false;
-      this.render();
+      this.renderClip();
     }
   }
 
   connectedCallback() {
     const songAttr = this.getAttribute('song');
-    if (songAttr) {
-      try {
-        this.song = typeof songAttr === 'string' ? JSON.parse(songAttr) : songAttr;
-        this.initFromSong();
-      } catch (e) {
-        this.song = null;
-      }
-    }
+    if (songAttr) this.parseSong(songAttr);
     this.render();
+    this.initFromSong();
+    this.animateOpen();
+    this.unsubscribeState = appState.subscribe((key) => {
+      if (key === 'playlists' || key === 'playFeeders') this.renderPlaylists();
+    });
   }
 
   disconnectedCallback() {
+    this.unsubscribeState?.();
     this.stopPreview();
+    this.handleSliderEnd();
+    this.showOrigin();
   }
 
   formatTime(seconds) {
@@ -136,417 +176,523 @@ class TrackEditor extends HTMLElement {
     return isNaN(total) ? null : total;
   }
 
+  /** True when the song is a library row (numeric id) that can be saved/deleted. */
+  isLibrarySong() {
+    const id = this.song?.id;
+    return id != null && (typeof id === 'number' || /^\d+$/.test(String(id)));
+  }
+
+  /**
+   * Render the sheet once. Later updates (duration loaded) only re-render the clip
+   * section, so the open animation and typed text survive them.
+   */
   render() {
     const song = this.song || {};
-    const canSave = song.id && (typeof song.id === 'number' || /^\d+$/.test(String(song.id)));
+    const canSave = this.isLibrarySong();
     const canShowRelated = canSave && ['youtube', 'soundcloud'].includes((song.source || '').toLowerCase());
-    const title = song.title ?? '';
-    const artist = song.artist ?? '';
 
     this.shadowRoot.innerHTML = `
       <style>
         :host {
           position: fixed;
-          top: 0;
-          left: 0;
-          right: 0;
-          bottom: 0;
+          inset: 0;
           z-index: 1000;
-          display: flex;
-          align-items: center;
-          justify-content: center;
+          --accent: #8000FF;
+          --accent-text: #b98cff;
+          --glass: rgba(255,255,255,0.07);
+          --glass-strong: rgba(255,255,255,0.12);
+          --hairline: rgba(255,255,255,0.12);
+          --muted: rgba(255,255,255,0.55);
+          --danger: #ff5a5f;
+          color: #fff;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
         }
+        button { font: inherit; -webkit-tap-highlight-color: transparent; }
         .backdrop {
           position: absolute;
           inset: 0;
-          background: rgba(0,0,0,0.7);
+          background: rgba(0,0,0,0.42);
+          -webkit-backdrop-filter: blur(26px) saturate(150%);
+          backdrop-filter: blur(26px) saturate(150%);
         }
-        .modal {
-          position: relative;
-          z-index: 1;
-          background: #2a2a2a;
-          border-radius: 12px;
-          padding: 24px;
-          max-width: 400px;
-          width: 90%;
-          max-height: 90vh;
+        /* The page-filling sheet. It's laid out at full size from the start; the open
+           animation only clips it (clip-path) from the origin's box, so nothing reflows. */
+        .sheet {
+          position: absolute;
+          top: max(12px, env(safe-area-inset-top));
+          bottom: max(12px, env(safe-area-inset-bottom));
+          left: max(12px, env(safe-area-inset-left));
+          right: max(12px, env(safe-area-inset-right));
+          max-width: 560px;
+          margin: 0 auto;
+          perspective: 1600px;
+        }
+        /* The card that flips. Each face is a full glass panel; the back one starts
+           turned away, and backface-visibility hides whichever faces away from you. */
+        .flipper {
+          position: absolute;
+          inset: 0;
+          transform-style: preserve-3d;
+          -webkit-transform-style: preserve-3d;
+        }
+        .face {
+          position: absolute;
+          inset: 0;
+          display: flex;
+          flex-direction: column;
+          border-radius: 28px;
+          background: linear-gradient(160deg, rgba(60,60,72,0.62), rgba(18,18,24,0.72));
+          border: 1px solid var(--hairline);
+          box-shadow: 0 30px 80px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.10);
+          overflow: hidden;
+          -webkit-backface-visibility: hidden;
+          backface-visibility: hidden;
+        }
+        .face.back {
+          transform: rotateY(180deg);
+          background: linear-gradient(200deg, rgba(64,44,92,0.66), rgba(16,14,24,0.76));
+        }
+        /* Only the face toward you takes taps. */
+        .sheet.show-back .front, .sheet:not(.show-back) .back { pointer-events: none; }
+        /* Darkens a face as it turns edge-on, so the spin reads as lit 3D. */
+        .shade {
+          position: absolute;
+          inset: 0;
+          background: linear-gradient(90deg, rgba(0,0,0,0.65), rgba(0,0,0,0.15));
+          opacity: 0;
+          pointer-events: none;
+          z-index: 3;
+        }
+        .sheet-scroll {
+          flex: 1 1 auto;
           overflow-y: auto;
-          box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+          overscroll-behavior: contain;
+          -webkit-overflow-scrolling: touch;
+          padding: 22px 20px 12px;
         }
-        .modal h3 {
-          margin: 0 0 20px 0;
-          color: #fff;
+
+        /* Header: cover + editable name/artist, styled like the slab's text. */
+        .head {
+          display: flex;
+          gap: 16px;
+          align-items: center;
+          margin-bottom: 26px;
         }
-        .field {
-          margin-bottom: 16px;
+        .cover {
+          flex: 0 0 auto;
+          width: 76px;
+          height: 76px;
+          border-radius: 16px;
+          background: var(--glass-strong) center / cover no-repeat;
+          box-shadow: 0 8px 24px rgba(0,0,0,0.45);
         }
-        .field label {
-          display: block;
-          font-size: 12px;
-          color: #aaa;
-          margin-bottom: 4px;
-        }
-        .field input[type="text"] {
+        .names { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+        .name-input {
           -webkit-user-select: text;
           user-select: text;
           -webkit-touch-callout: default;
           width: 100%;
-          padding: 10px 12px;
-          background: #1a1a1a;
-          border: 1px solid #444;
-          border-radius: 8px;
-          color: #fff;
-          font-size: 16px;
           box-sizing: border-box;
+          background: transparent;
+          border: none;
+          border-radius: 10px;
+          color: #fff;
+          padding: 4px 8px;
+          margin-left: -8px;
+          transition: background 150ms;
+          text-overflow: ellipsis;
         }
-        .field input[type="text"]:focus {
-          outline: none;
-          border-color: #1db954;
+        .name-input:focus { outline: none; background: var(--glass-strong); }
+        .title-input { font-size: 22px; font-weight: 700; line-height: 30px; }
+        .artist-input { font-size: 17px; line-height: 24px; color: rgba(255,255,255,0.75); }
+        .name-input::placeholder { color: rgba(255,255,255,0.3); }
+        .flip-btn {
+          flex: 0 0 auto;
+          align-self: flex-start;
+          width: 34px;
+          height: 34px;
+          padding: 0;
+          border-radius: 50%;
+          border: none;
+          background: var(--glass-strong);
+          color: rgba(255,255,255,0.85);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
         }
-        .range-container {
-          margin: 20px 0;
+        .flip-btn svg { width: 18px; height: 18px; }
+
+        /* Back face: the track's playlists. */
+        .back-head {
+          display: flex;
+          gap: 14px;
+          align-items: center;
+          padding: 22px 20px 16px;
+          border-bottom: 1px solid var(--hairline);
         }
+        .back-head .cover { width: 52px; height: 52px; border-radius: 12px; }
+        .back-titles { flex: 1 1 auto; min-width: 0; }
+        .back-title { font-size: 20px; font-weight: 700; line-height: 26px; }
+        .back-sub {
+          font-size: 13px;
+          color: var(--muted);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .back-scroll {
+          flex: 1 1 auto;
+          overflow-y: auto;
+          overscroll-behavior: contain;
+          -webkit-overflow-scrolling: touch;
+          padding: 18px 20px 20px;
+        }
+        .pl-icon {
+          flex: 0 0 auto;
+          width: 40px;
+          height: 40px;
+          border-radius: 10px;
+          background: var(--glass-strong) center / cover no-repeat;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: var(--muted);
+        }
+        .pl-text { flex: 1 1 auto; min-width: 0; }
+        .pl-name { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .check {
+          flex: 0 0 auto;
+          width: 26px;
+          height: 26px;
+          border-radius: 50%;
+          border: 2px solid rgba(255,255,255,0.3);
+          box-sizing: border-box;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          transition: background 160ms, border-color 160ms, transform 160ms;
+        }
+        .check svg { width: 14px; height: 14px; opacity: 0; transition: opacity 160ms; }
+        .row.member .check { background: var(--accent); border-color: var(--accent); box-shadow: 0 0 12px rgba(128,0,255,0.5); }
+        .row.member .check svg { opacity: 1; }
+        .row:active .check { transform: scale(0.88); }
+        .row.pending .check { opacity: 0.6; }
+        .empty { color: var(--muted); font-size: 14px; padding: 6px 4px; }
+
+        .section-label {
+          font-size: 12px;
+          font-weight: 600;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: var(--muted);
+          margin: 0 4px 10px;
+        }
+        .card {
+          background: var(--glass);
+          border: 1px solid var(--hairline);
+          border-radius: 20px;
+          padding: 18px 16px;
+          margin-bottom: 22px;
+        }
+        .loading { color: var(--muted); font-size: 14px; margin: 6px 0; }
+
+        /* Clip range slider */
         .range-track {
           position: relative;
-          height: 24px;
-          margin: 0 12px;
+          height: 32px;
+          margin: 4px 14px 0;
         }
-        .range-bar {
+        .range-bar, .range-fill {
           position: absolute;
           top: 50%;
           transform: translateY(-50%);
-          height: 6px;
-          background: #444;
-          border-radius: 3px;
-          left: 0;
-          right: 0;
+          height: 8px;
+          border-radius: 4px;
         }
+        .range-bar { left: 0; right: 0; background: rgba(255,255,255,0.14); }
         .range-fill {
-          position: absolute;
-          top: 50%;
-          transform: translateY(-50%);
-          height: 6px;
-          background: #1db954;
-          border-radius: 3px;
+          background: linear-gradient(90deg, var(--accent), #a64dff);
+          box-shadow: 0 0 14px rgba(128,0,255,0.55);
           pointer-events: none;
         }
         .range-thumb {
           position: absolute;
           top: 50%;
           transform: translate(-50%, -50%);
-          width: 20px;
-          height: 20px;
-          background: #1db954;
+          width: 26px;
+          height: 26px;
+          background: #fff;
           border-radius: 50%;
+          box-shadow: 0 2px 10px rgba(0,0,0,0.45);
           cursor: grab;
           z-index: 2;
           touch-action: none;
         }
-        .range-thumb:active {
-          cursor: grabbing;
-        }
-        .range-labels {
+        .range-thumb:active { cursor: grabbing; transform: translate(-50%, -50%) scale(1.12); }
+        .range-ends {
           display: flex;
           justify-content: space-between;
-          margin-top: 8px;
-          font-size: 12px;
-          color: #aaa;
-        }
-        .precision-hint {
           font-size: 11px;
-          color: #888;
-          margin: 10px 0 2px 0;
+          color: var(--muted);
+          margin: 6px 2px 0;
+          font-variant-numeric: tabular-nums;
         }
-        .time-control {
-          margin-top: 12px;
-        }
+        .precision-hint { font-size: 11px; color: var(--muted); margin: 10px 2px 4px; }
+
+        .time-control { margin-top: 16px; }
         .time-control-head {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          margin-bottom: 6px;
+          margin-bottom: 8px;
         }
-        .time-control-title {
-          font-size: 12px;
-          color: #aaa;
-        }
+        .time-control-title { font-size: 14px; font-weight: 600; }
         .preview-btn {
-          background: #1a1a1a;
-          border: 1px solid #444;
-          color: #1db954;
-          border-radius: 6px;
+          background: var(--glass-strong);
+          border: none;
+          color: var(--accent-text);
+          border-radius: 999px;
           font-size: 12px;
-          padding: 4px 10px;
-          cursor: pointer;
           font-weight: 600;
+          padding: 6px 12px;
+          cursor: pointer;
         }
-        .preview-btn.playing {
-          background: #1db954;
-          color: #fff;
-          border-color: #1db954;
-        }
-        @media (hover: hover) {
-          .preview-btn:hover {
-            border-color: #1db954;
-          }
-        }
-        .time-row {
-          display: flex;
-          align-items: center;
-          gap: 4px;
-        }
+        .preview-btn.playing { background: var(--accent); color: #fff; }
+        .time-row { display: flex; align-items: center; gap: 4px; }
         .adj-btn {
-          flex: 0 0 auto;
-          min-width: 34px;
-          padding: 6px 0;
-          background: #1a1a1a;
-          border: 1px solid #444;
-          color: #ddd;
-          border-radius: 6px;
+          flex: 1 1 0;
+          min-width: 0;
+          padding: 8px 0;
+          background: var(--glass);
+          border: none;
+          color: rgba(255,255,255,0.8);
+          border-radius: 10px;
           font-size: 11px;
-          cursor: pointer;
           font-weight: 600;
+          cursor: pointer;
         }
-        @media (hover: hover) {
-          .adj-btn:hover {
-            background: #333;
-            border-color: #1db954;
-          }
-        }
+        .adj-btn:active { background: var(--glass-strong); }
         .time-input {
-          flex: 1 1 auto;
+          flex: 2.4 1 0;
           min-width: 0;
           text-align: center;
-          padding: 6px 4px;
-          background: #1a1a1a;
-          border: 1px solid #444;
-          border-radius: 6px;
+          padding: 7px 4px;
+          background: rgba(0,0,0,0.28);
+          border: 1px solid transparent;
+          border-radius: 10px;
           color: #fff;
-          font-size: 14px;
+          font-size: 15px;
           font-variant-numeric: tabular-nums;
           box-sizing: border-box;
         }
-        .time-input:focus {
-          outline: none;
-          border-color: #1db954;
-        }
-        .units-hint {
-          font-size: 10px;
-          color: #777;
-          text-align: right;
-          margin: 4px 0 0 0;
-        }
-        .actions {
+        .time-input:focus { outline: none; border-color: var(--accent); }
+        .units-hint { font-size: 10px; color: var(--muted); text-align: right; margin: 8px 2px 0; }
+
+        /* Action list: iOS-style grouped rows. */
+        .list { padding: 0; overflow: hidden; }
+        .row {
           display: flex;
+          align-items: center;
           gap: 12px;
-          margin-top: 24px;
+          width: 100%;
+          padding: 15px 16px;
+          background: none;
+          border: none;
+          color: #fff;
+          font-size: 16px;
+          text-align: left;
+          cursor: pointer;
+        }
+        .row + .row { border-top: 1px solid var(--hairline); }
+        .row:active:not(:disabled) { background: var(--glass); }
+        .row:disabled { opacity: 0.4; cursor: not-allowed; }
+        .row .icon { width: 22px; text-align: center; }
+        .row .sub { display: block; font-size: 12px; color: var(--muted); margin-top: 2px; }
+        .row.danger { color: var(--danger); }
+        @media (hover: hover) {
+          .row:hover:not(:disabled), .adj-btn:hover { background: var(--glass-strong); }
+          .flip-btn:hover { color: #fff; }
+        }
+
+        /* Pinned footer */
+        .actions {
+          flex: 0 0 auto;
+          display: flex;
+          gap: 10px;
+          padding: 12px 20px 18px;
+          border-top: 1px solid var(--hairline);
+          background: rgba(10,10,14,0.25);
         }
         .actions button {
           flex: 1;
-          padding: 12px;
+          padding: 14px;
           border: none;
-          border-radius: 8px;
+          border-radius: 16px;
           font-size: 16px;
-          cursor: pointer;
           font-weight: 600;
+          cursor: pointer;
         }
+        .cancel-btn { background: var(--glass-strong); color: #fff; }
         .save-btn {
-          background: #1db954;
+          background: var(--accent);
           color: #fff;
+          box-shadow: 0 6px 20px rgba(128,0,255,0.45);
         }
-        @media (hover: hover) {
-          .save-btn:hover {
-            background: #1ed760;
-          }
-        }
-        .save-btn:disabled {
-          background: #555;
-          cursor: not-allowed;
-        }
-        .cancel-btn {
-          background: #444;
-          color: #fff;
-        }
-        @media (hover: hover) {
-          .cancel-btn:hover {
-            background: #555;
-          }
-        }
-        .delete-btn {
-          flex: 0 0 auto;
-          padding: 12px 16px;
-          border: none;
-          border-radius: 8px;
-          font-size: 16px;
-          cursor: pointer;
-          font-weight: 600;
-          background: #c0392b;
-          color: #fff;
-        }
-        @media (hover: hover) {
-          .delete-btn:hover {
-            background: #e74c3c;
-          }
-        }
-        .delete-btn:disabled {
-          background: #555;
-          cursor: not-allowed;
-        }
-        .loading {
-          color: #aaa;
-          font-size: 14px;
-        }
-        .redownload-btn {
-          width: 100%;
-          padding: 12px;
-          border: 1px solid #444;
-          border-radius: 8px;
-          font-size: 15px;
-          cursor: pointer;
-          font-weight: 600;
-          background: #1a1a1a;
-          color: #ddd;
-          margin-top: 4px;
-        }
-        @media (hover: hover) {
-          .redownload-btn:hover:not(:disabled) {
-            background: #333;
-            border-color: #1db954;
-          }
-        }
-        .redownload-btn:disabled {
-          opacity: 0.6;
-          cursor: not-allowed;
-        }
-        .redownload-hint {
-          font-size: 11px;
-          color: #888;
-          margin: 6px 0 0 0;
-          text-align: center;
-        }
+        .save-btn:disabled { background: rgba(255,255,255,0.15); box-shadow: none; cursor: not-allowed; }
       </style>
 
       <div class="backdrop" id="backdrop"></div>
-      <div class="modal">
-        <h3>Edit Track</h3>
+      <div class="sheet" role="dialog" aria-label="Edit track">
+        <div class="flipper">
+          <div class="face front">
+            <div class="shade"></div>
+            <div class="sheet-scroll">
+              <div class="content">
+                <div class="head">
+                  <div class="cover" id="cover"></div>
+                  <div class="names">
+                    <input type="text" class="name-input title-input" id="title-input" placeholder="Track name" aria-label="Name">
+                    <input type="text" class="name-input artist-input" id="artist-input" placeholder="Artist" aria-label="Artist">
+                  </div>
+                  <button class="flip-btn" aria-label="Playlists">${FLIP_ICON}</button>
+                </div>
 
-        <div class="field">
-          <label>Name</label>
-          <input type="text" id="title-input" value="${title.replace(/"/g, '&quot;')}" placeholder="Track name">
-        </div>
-        <div class="field">
-          <label>Artist</label>
-          <input type="text" id="artist-input" value="${artist.replace(/"/g, '&quot;')}" placeholder="Artist">
-        </div>
+                <div class="section-label">Clip</div>
+                <div class="card" id="clip"></div>
 
-        <div class="field range-container">
-          <label>Start / End Time</label>
-          ${this.isLoadingDuration
-            ? '<p class="loading">Loading duration...</p>'
-            : `
-          <div class="range-track" id="range-track">
-            <div class="range-bar"></div>
-            <div class="range-fill" id="range-fill"></div>
-            <div class="range-thumb" id="thumb-start" data-thumb="start"></div>
-            <div class="range-thumb" id="thumb-end" data-thumb="end"></div>
-          </div>
-          <p class="precision-hint">Drag a handle — move further above or below the bar for finer (slower) control.</p>
-
-          <div class="time-control">
-            <div class="time-control-head">
-              <span class="time-control-title">Start</span>
-              <button class="preview-btn" id="preview-start" data-preview="start">▶ First ${PREVIEW_SECONDS}s</button>
+                <div class="section-label">Track</div>
+                <div class="card list">
+                  ${canShowRelated ? `<button class="row" id="related-btn"><span class="icon">🔗</span><span>Show related</span></button>` : ''}
+                  <button class="row" id="redownload-btn" ${!canSave ? 'disabled' : ''}>
+                    <span class="icon">🔄</span>
+                    <span><span class="label">Re-download file</span><span class="sub">Re-fetch the audio if the wrong file got attached</span></span>
+                  </button>
+                  <button class="row danger" id="delete-btn" ${!canSave ? 'disabled' : ''}><span class="icon">🗑</span><span>Delete track</span></button>
+                </div>
+              </div>
             </div>
-            <div class="time-row">
-              <button class="adj-btn" data-adjust="start" data-delta="-1000">−1s</button>
-              <button class="adj-btn" data-adjust="start" data-delta="-100">−100</button>
-              <button class="adj-btn" data-adjust="start" data-delta="-10">−10</button>
-              <input type="text" class="time-input" id="start-input" inputmode="decimal" value="${this.formatTimeMs(this.startTime)}">
-              <button class="adj-btn" data-adjust="start" data-delta="10">+10</button>
-              <button class="adj-btn" data-adjust="start" data-delta="100">+100</button>
-              <button class="adj-btn" data-adjust="start" data-delta="1000">+1s</button>
+            <div class="actions">
+              <button class="cancel-btn" id="cancel-btn">Cancel</button>
+              <button class="save-btn" id="save-btn" ${!canSave ? 'disabled' : ''}>Save</button>
             </div>
           </div>
 
-          <div class="time-control">
-            <div class="time-control-head">
-              <span class="time-control-title">End</span>
-              <button class="preview-btn" id="preview-end" data-preview="end">▶ Last ${PREVIEW_SECONDS}s</button>
+          <div class="face back">
+            <div class="shade"></div>
+            <div class="back-head">
+              <div class="cover"></div>
+              <div class="back-titles">
+                <div class="back-title">Playlists</div>
+                <div class="back-sub" id="back-sub"></div>
+              </div>
+              <button class="flip-btn" aria-label="Back to track">${FLIP_ICON}</button>
             </div>
-            <div class="time-row">
-              <button class="adj-btn" data-adjust="end" data-delta="-1000">−1s</button>
-              <button class="adj-btn" data-adjust="end" data-delta="-100">−100</button>
-              <button class="adj-btn" data-adjust="end" data-delta="-10">−10</button>
-              <input type="text" class="time-input" id="end-input" inputmode="decimal" value="${this.formatTimeMs(this.endTime)}">
-              <button class="adj-btn" data-adjust="end" data-delta="10">+10</button>
-              <button class="adj-btn" data-adjust="end" data-delta="100">+100</button>
-              <button class="adj-btn" data-adjust="end" data-delta="1000">+1s</button>
+            <div class="back-scroll" id="playlists"></div>
+            <div class="actions">
+              <button class="save-btn" id="done-btn">Done</button>
             </div>
           </div>
-          <p class="units-hint">±10 / ±100 are milliseconds · format m:ss.mmm</p>
-          `
-          }
-        </div>
-
-        <div class="field">
-          <button class="redownload-btn" id="redownload-btn" ${!canSave ? 'disabled' : ''}>🔄 Re-download file</button>
-          <p class="redownload-hint">Re-fetches the audio from the original source if the wrong file got attached.</p>
-          ${canShowRelated ? '<button class="redownload-btn" id="related-btn" style="margin-top: 12px;">🔗 Show related</button>' : ''}
-        </div>
-
-        <div class="actions">
-          <button class="delete-btn" id="delete-btn" ${!canSave ? 'disabled' : ''}>🗑</button>
-          <button class="cancel-btn" id="cancel-btn">Cancel</button>
-          <button class="save-btn" id="save-btn" ${!canSave ? 'disabled' : ''}>Save</button>
         </div>
       </div>
     `;
 
-    this.attachEventListeners();
-    if (!this.isLoadingDuration) {
-      this.updateSliderPositions();
+    // Values set as properties, not interpolated, so quotes/markup in names are inert.
+    this.shadowRoot.getElementById('title-input').value = song.title ?? '';
+    this.shadowRoot.getElementById('artist-input').value = song.artist ?? '';
+    if (song.cover) {
+      const url = `url("${String(song.cover).replace(/"/g, '%22')}")`;
+      this.shadowRoot.querySelectorAll('.cover').forEach((el) => { el.style.backgroundImage = url; });
     }
+    this.shadowRoot.getElementById('back-sub').textContent =
+      [song.title, song.artist].filter(Boolean).join(' — ');
+
+    this.attachEventListeners();
+    this.renderClip();
+    this.renderPlaylists();
+  }
+
+  /** Render the clip card (slider + start/end controls) for the current duration state. */
+  renderClip() {
+    const clip = this.shadowRoot.getElementById('clip');
+    if (!clip) return;
+
+    if (this.isLoadingDuration) {
+      clip.innerHTML = '<p class="loading">Loading duration…</p>';
+      return;
+    }
+
+    clip.innerHTML = `
+      <div class="range-track" id="range-track">
+        <div class="range-bar"></div>
+        <div class="range-fill" id="range-fill"></div>
+        <div class="range-thumb" id="thumb-start" data-thumb="start"></div>
+        <div class="range-thumb" id="thumb-end" data-thumb="end"></div>
+      </div>
+      <div class="range-ends"><span>0:00</span><span>${this.formatTime(this.duration)}</span></div>
+      <p class="precision-hint">Drag a handle — move further above or below the bar for finer control.</p>
+      ${this.timeControlHtml('start', 'Start', `▶ First ${PREVIEW_SECONDS}s`)}
+      ${this.timeControlHtml('end', 'End', `▶ Last ${PREVIEW_SECONDS}s`)}
+      <p class="units-hint">±10 / ±100 are milliseconds · m:ss.mmm</p>
+    `;
+
+    this.attachClipListeners();
+    this.updateSliderPositions();
+    this.updatePreviewButtons();
+  }
+
+  /**
+   * Markup for one cutoff's controls: title, preview pill and ± nudges around the field.
+   * @param {'start'|'end'} which
+   * @param {string} title
+   * @param {string} previewLabel
+   * @returns {string}
+   */
+  timeControlHtml(which, title, previewLabel) {
+    const adj = (delta, label) => `<button class="adj-btn" data-adjust="${which}" data-delta="${delta}">${label}</button>`;
+    return `
+      <div class="time-control">
+        <div class="time-control-head">
+          <span class="time-control-title">${title}</span>
+          <button class="preview-btn" id="preview-${which}" data-preview="${which}">${previewLabel}</button>
+        </div>
+        <div class="time-row">
+          ${adj(-1000, '−1s')}${adj(-100, '−100')}${adj(-10, '−10')}
+          <input type="text" class="time-input" id="${which}-input" inputmode="decimal">
+          ${adj(10, '+10')}${adj(100, '+100')}${adj(1000, '+1s')}
+        </div>
+      </div>
+    `;
   }
 
   attachEventListeners() {
-    const titleInput = this.shadowRoot.getElementById('title-input');
-    const artistInput = this.shadowRoot.getElementById('artist-input');
-    const saveBtn = this.shadowRoot.getElementById('save-btn');
-    const cancelBtn = this.shadowRoot.getElementById('cancel-btn');
+    const $ = (id) => this.shadowRoot.getElementById(id);
 
-    if (titleInput) {
-      titleInput.addEventListener('input', (e) => { this.song = { ...this.song, title: e.target.value }; });
-    }
-    if (artistInput) {
-      artistInput.addEventListener('input', (e) => { this.song = { ...this.song, artist: e.target.value }; });
-    }
-    if (cancelBtn) {
-      cancelBtn.addEventListener('click', () => this.close());
-    }
+    $('title-input').addEventListener('input', (e) => { this.song = { ...this.song, title: e.target.value }; });
+    $('artist-input').addEventListener('input', (e) => { this.song = { ...this.song, artist: e.target.value }; });
+    [$('title-input'), $('artist-input')].forEach((field) => {
+      field.addEventListener('keydown', (e) => { if (e.key === 'Enter') field.blur(); });
+    });
 
-    const backdrop = this.shadowRoot.getElementById('backdrop');
-    if (backdrop) {
-      backdrop.addEventListener('click', () => this.close());
-    }
-    if (saveBtn) {
-      saveBtn.addEventListener('click', () => this.save());
-    }
+    $('cancel-btn').addEventListener('click', () => this.close());
+    $('done-btn').addEventListener('click', () => this.close());
+    this.shadowRoot.querySelectorAll('.flip-btn').forEach((btn) => btn.addEventListener('click', () => this.flip()));
+    $('playlists').addEventListener('click', (e) => {
+      const row = e.target.closest('[data-playlist]');
+      if (row) this.togglePlaylist(Number(row.dataset.playlist));
+    });
+    $('backdrop').addEventListener('click', () => this.close());
+    $('save-btn').addEventListener('click', () => this.save());
+    $('delete-btn').addEventListener('click', () => this.delete());
+    $('redownload-btn').addEventListener('click', () => this.redownload());
+    $('related-btn')?.addEventListener('click', () => this.showRelated());
 
-    const deleteBtn = this.shadowRoot.getElementById('delete-btn');
-    if (deleteBtn) {
-      deleteBtn.addEventListener('click', () => this.delete());
-    }
+    // Swipes on the blurred backdrop mustn't scroll the page underneath.
+    $('backdrop').addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+  }
 
-    const redownloadBtn = this.shadowRoot.getElementById('redownload-btn');
-    if (redownloadBtn) {
-      redownloadBtn.addEventListener('click', () => this.redownload());
-    }
-
-    const relatedBtn = this.shadowRoot.getElementById('related-btn');
-    if (relatedBtn) {
-      relatedBtn.addEventListener('click', () => this.showRelated());
-    }
-
+  /** Wire the clip card's controls (re-run whenever renderClip replaces them). */
+  attachClipListeners() {
     // ± adjustment buttons (millisecond nudges)
     this.shadowRoot.querySelectorAll('.adj-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -555,11 +701,9 @@ class TrackEditor extends HTMLElement {
     });
 
     // Editable time fields — commit on blur or Enter.
-    const startField = this.shadowRoot.getElementById('start-input');
-    const endField = this.shadowRoot.getElementById('end-input');
-    [startField, endField].forEach((field) => {
+    ['start', 'end'].forEach((which) => {
+      const field = this.shadowRoot.getElementById(`${which}-input`);
       if (!field) return;
-      const which = field.id === 'start-input' ? 'start' : 'end';
       field.addEventListener('change', () => this.commitTimeInput(which));
       field.addEventListener('keydown', (e) => { if (e.key === 'Enter') field.blur(); });
     });
@@ -569,16 +713,218 @@ class TrackEditor extends HTMLElement {
       btn.addEventListener('click', () => this.togglePreview(btn.dataset.preview));
     });
 
-    const thumbStart = this.shadowRoot.getElementById('thumb-start');
-    const thumbEnd = this.shadowRoot.getElementById('thumb-end');
-    if (thumbStart) {
-      thumbStart.addEventListener('mousedown', (e) => this.handleSliderStart(e, 'start'));
-      thumbStart.addEventListener('touchstart', (e) => this.handleSliderStart(e, 'start'), { passive: false });
+    ['start', 'end'].forEach((which) => {
+      const thumb = this.shadowRoot.getElementById(`thumb-${which}`);
+      if (!thumb) return;
+      thumb.addEventListener('mousedown', (e) => this.handleSliderStart(e, which));
+      thumb.addEventListener('touchstart', (e) => this.handleSliderStart(e, which), { passive: false });
+    });
+  }
+
+  /**
+   * Whether the song is in a playlist, counting a toggle that's still in flight.
+   * @param {Object} playlist
+   * @returns {boolean}
+   */
+  isMember(playlist) {
+    if (this.pendingToggles.has(playlist.id)) return this.pendingToggles.get(playlist.id);
+    return (playlist.songs || []).some((s) => String(s.id) === String(this.song?.id));
+  }
+
+  /** Render the back face: feeder playlists first, then the rest, each with a check. */
+  renderPlaylists() {
+    const box = this.shadowRoot.getElementById('playlists');
+    if (!box) return;
+    if (!this.isLibrarySong()) {
+      box.innerHTML = '<p class="empty">Only library tracks can be added to playlists.</p>';
+      return;
     }
-    if (thumbEnd) {
-      thumbEnd.addEventListener('mousedown', (e) => this.handleSliderStart(e, 'end'));
-      thumbEnd.addEventListener('touchstart', (e) => this.handleSliderStart(e, 'end'), { passive: false });
+    const playlists = (appState.get('playlists') || []).filter((p) => p.kind !== 'orphans');
+    const feederIds = appState.get('playFeeders') || [];
+    const feeders = playlists.filter((p) => feederIds.includes(p.id));
+    const others = playlists.filter((p) => !feederIds.includes(p.id));
+
+    const row = (p) => {
+      const member = this.isMember(p);
+      const count = (p.songs || []).length;
+      const icon = p.icon
+        ? `<span class="pl-icon" style="background-image: url(&quot;${esc(p.icon)}&quot;)"></span>`
+        : `<span class="pl-icon">${NOTE_ICON}</span>`;
+      return `
+        <button class="row ${member ? 'member' : ''} ${this.pendingToggles.has(p.id) ? 'pending' : ''}"
+                data-playlist="${p.id}" aria-pressed="${member}">
+          ${icon}
+          <span class="pl-text"><span class="pl-name">${esc(p.name)}</span><span class="sub">${count} track${count === 1 ? '' : 's'}</span></span>
+          <span class="check">${CHECK_ICON}</span>
+        </button>`;
+    };
+    const section = (label, list) => list.length
+      ? `<div class="section-label">${label}</div><div class="card list">${list.map(row).join('')}</div>`
+      : '';
+
+    // Keep the scroll position across re-renders (they happen on every toggle).
+    const scroll = box.scrollTop;
+    box.innerHTML = playlists.length
+      ? section('Feeders', feeders) + section(feeders.length ? 'Other playlists' : 'Playlists', others)
+      : '<p class="empty">No playlists yet.</p>';
+    box.scrollTop = scroll;
+  }
+
+  /**
+   * Add the song to, or remove it from, a playlist. Shown optimistically; the app does
+   * the work (see MusicApp.togglePlaylistMembership) and reports success via detail.result.
+   * @param {number} playlistId
+   */
+  async togglePlaylist(playlistId) {
+    const playlist = (appState.get('playlists') || []).find((p) => p.id === playlistId);
+    if (!playlist || this.pendingToggles.has(playlistId)) return;
+    const add = !this.isMember(playlist);
+    this.pendingToggles.set(playlistId, add);
+    this.renderPlaylists();
+
+    const s = this.song;
+    const detail = {
+      playlistId,
+      add,
+      song: { id: s.id, title: s.title, artist: s.artist, cover: s.cover, source: s.source,
+              url: s.url, start_time: s.start_time ?? null, end_time: s.end_time ?? null },
+      result: null
+    };
+    this.dispatchEvent(new CustomEvent('playlist-toggle', { detail, bubbles: true }));
+    try {
+      await detail.result;
+    } finally {
+      this.pendingToggles.delete(playlistId);
+      this.renderPlaylists();
     }
+  }
+
+  /**
+   * Spin the card over to the other side. Always turns the same way (front→back is
+   * 0→180°, back→front 180→360°), dipping back in depth mid-turn, with each face
+   * shaded as it goes edge-on.
+   */
+  flip() {
+    if (this.flipping || this.closing) return;
+    this.flipping = true;
+    this.shadowRoot.activeElement?.blur();
+
+    const sheet = this.shadowRoot.querySelector('.sheet');
+    const flipper = this.shadowRoot.querySelector('.flipper');
+    const from = this.flipped ? 180 : 0;
+    const to = from + 180;
+    this.flipped = !this.flipped;
+    sheet.classList.toggle('show-back', this.flipped);
+    if (this.flipped) this.renderPlaylists();
+
+    const timing = { duration: FLIP_MS, easing: 'cubic-bezier(0.55, 0.05, 0.3, 1)' };
+    const anim = flipper.animate([
+      { transform: `rotateY(${from}deg)` },
+      { transform: `translateZ(-140px) rotateY(${from + 90}deg) scale(0.94)`, offset: 0.5 },
+      { transform: `rotateY(${to}deg)` }
+    ], timing);
+    this.shadowRoot.querySelectorAll('.shade').forEach((shade) => shade.animate(
+      [{ opacity: 0 }, { opacity: 1, offset: 0.5 }, { opacity: 0 }], timing
+    ));
+
+    anim.finished.catch(() => {}).then(() => {
+      flipper.style.transform = this.flipped ? 'rotateY(180deg)' : '';
+      this.flipping = false;
+    });
+  }
+
+  /**
+   * The origin's visible box, in viewport px, or null when there's none to grow from.
+   * @returns {{top:number,left:number,right:number,bottom:number,radius:number}|null}
+   */
+  originBox() {
+    const el = this.origin?.el;
+    if (!el || !el.isConnected) return null;
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    const inset = this.origin.inset || 0;
+    return {
+      top: r.top + inset, left: r.left + inset,
+      right: r.right - inset, bottom: r.bottom - inset,
+      radius: this.origin.radius ?? 20
+    };
+  }
+
+  /**
+   * clip-path that crops the sheet down to the origin's box.
+   * @param {Object} box - From originBox()
+   * @returns {string}
+   */
+  originClip(box) {
+    const s = this.shadowRoot.querySelector('.sheet').getBoundingClientRect();
+    const t = box.top - s.top;
+    const l = box.left - s.left;
+    const r = s.right - box.right;
+    const b = s.bottom - box.bottom;
+    return `inset(${t}px ${r}px ${b}px ${l}px round ${box.radius}px)`;
+  }
+
+  /** @returns {Element[]} Each face's contents, faded in/out around the grow/shrink. */
+  faceContents() {
+    return [...this.shadowRoot.querySelectorAll('.content, .actions, .back-head, .back-scroll')];
+  }
+
+  /** Grow the sheet out of the origin (or fade/scale it in), blurring the page behind. */
+  animateOpen() {
+    const sheet = this.shadowRoot.querySelector('.sheet');
+    const backdrop = this.shadowRoot.getElementById('backdrop');
+    const opts = { duration: OPEN_MS, easing: EASE };
+
+    backdrop.animate([{ opacity: 0 }, { opacity: 1 }], { duration: OPEN_MS * 0.8, easing: 'ease-out' });
+
+    const box = this.originBox();
+    if (box) {
+      this.origin.el.style.visibility = 'hidden';
+      sheet.animate([
+        { clipPath: this.originClip(box) },
+        { clipPath: 'inset(0px 0px 0px 0px round 28px)' }
+      ], opts);
+    } else {
+      sheet.animate([
+        { opacity: 0, transform: 'scale(0.94)' },
+        { opacity: 1, transform: 'none' }
+      ], opts);
+    }
+    // Contents fade in once the sheet has mostly opened.
+    this.faceContents().forEach((el) => el.animate(
+      [{ opacity: 0, transform: 'translateY(8px)' }, { opacity: 1, transform: 'none' }],
+      { duration: OPEN_MS * 0.7, delay: OPEN_MS * 0.3, easing: 'ease-out', fill: 'backwards' }
+    ));
+  }
+
+  /** Reverse of animateOpen. Resolves when the sheet is gone. */
+  animateClose() {
+    const sheet = this.shadowRoot.querySelector('.sheet');
+    const backdrop = this.shadowRoot.getElementById('backdrop');
+    if (!sheet) return Promise.resolve();
+    const opts = { duration: OPEN_MS * 0.8, easing: EASE, fill: 'forwards' };
+
+    this.faceContents().forEach((el) => el.animate(
+      [{ opacity: 1 }, { opacity: 0 }], { duration: OPEN_MS * 0.3, fill: 'forwards' }
+    ));
+    backdrop.animate([{ opacity: 1 }, { opacity: 0 }], { ...opts, easing: 'ease-in' });
+
+    const box = this.originBox();
+    const anim = box
+      ? sheet.animate([
+          { clipPath: 'inset(0px 0px 0px 0px round 28px)' },
+          { clipPath: this.originClip(box) }
+        ], opts)
+      : sheet.animate([
+          { opacity: 1, transform: 'none' },
+          { opacity: 0, transform: 'scale(0.94)' }
+        ], opts);
+    return anim.finished.catch(() => {});
+  }
+
+  /** Un-hide the origin element. */
+  showOrigin() {
+    if (this.origin?.el) this.origin.el.style.visibility = '';
   }
 
   updateSliderPositions() {
@@ -759,10 +1105,11 @@ class TrackEditor extends HTMLElement {
 
     const songId = typeof this.song.id === 'string' ? parseInt(this.song.id, 10) : this.song.id;
     const btn = this.shadowRoot.getElementById('redownload-btn');
+    const label = btn?.querySelector('.label');
 
     if (btn) {
       btn.disabled = true;
-      btn.textContent = '⏳ Queuing...';
+      label.textContent = 'Queuing…';
     }
 
     try {
@@ -779,7 +1126,7 @@ class TrackEditor extends HTMLElement {
       alert('Failed to re-download: ' + (err.message || 'Unknown error'));
       if (btn) {
         btn.disabled = false;
-        btn.textContent = '🔄 Re-download file';
+        label.textContent = 'Re-download file';
       }
     }
   }
@@ -870,9 +1217,15 @@ class TrackEditor extends HTMLElement {
     }
   }
 
-  close() {
+  /** Shrink back into the origin (or fade out), then remove. */
+  async close() {
+    if (this.closing) return;
+    this.closing = true;
     this.stopPreview();
+    this.handleSliderEnd();
+    this.style.pointerEvents = 'none';
     this.dispatchEvent(new CustomEvent('close', { bubbles: true }));
+    await this.animateClose();
     this.remove();
   }
 }
