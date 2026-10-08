@@ -9,27 +9,50 @@
  *  - Tap the row            → enqueue (bubbles as 'enqueue-song' from the host tab).
  *    Repeated taps cycle enqueue → move-to-front → play, handled by MusicApp.enqueueSong.
  *  - Tap the queue indicator → remove from queue (emits 'remove-from-queue' { songId, index }).
- *  - Swipe right-to-left    → toggle membership of the working playlist
- *                             (emits 'add-to-playlist' or 'remove-from-playlist' { song }).
+ *  - Swipe left-to-right    → same as a tap: enqueue (emits 'enqueue-song' { song }).
+ *                             Playlist membership lives in the track editor's flip menu.
  *  - Long-press (library)   → edit (emits 'track-edit-request' { song, origin }).
  *
- * Membership UI reads the working playlist from appState ('workingPlaylist'). A rotated
- * square of the playlist icon peeks in from the right as a triangle when the track is a
- * member; swiping reveals "add to / remove from <playlist>" and drags the triangle in/out.
- *
  * Attributes:
- *  - no-swipe : disable the membership swipe gesture (tap + queue indicator still work).
+ *  - no-swipe : disable the enqueue swipe gesture (tap + queue indicator still work).
  *
- * Emits: 'enqueue-song' (via bubbling click), 'remove-from-queue', 'add-to-playlist',
- *        'remove-from-playlist', 'track-edit-request'.
+ * Emits: 'enqueue-song' (via bubbling click, or directly on a committed swipe),
+ *        'remove-from-queue', 'toggle-play-pause', 'track-edit-request'.
  */
 
 import appState from '../state/appState.js';
 
-const MAX_SWIPE = 240;       // px the content can slide while swiping (wide enough to read the action text)
-const SWIPE_THRESHOLD = 80;  // px past which a swipe toggles membership (same cutoff as before)
-const TAB_REVEAL = 150;      // px of drag over which the playlist triangle fully peeks in
+const MAX_SWIPE = 160;       // px the content can slide while swiping (wide enough to read the action text)
+const SWIPE_THRESHOLD = 80;  // px past which a swipe enqueues (same cutoff as playlist-item)
+const SETTLE_MS = 350;       // snap-back transition (0.3s) plus slack, before the layer is dropped
 const DIR_LOCK = 8;          // px before we decide horizontal-vs-vertical intent
+
+const PLAY_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="#fff"><path d="M8 5v14l11-7z"/></svg>';
+const REMOVE_SVG = '<svg class="q-remove" viewBox="0 0 24 24" width="15" height="15" fill="#fff"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>';
+
+/**
+ * Markup for the queue wedge in a given state.
+ * @param {'playing'|'removable'} state
+ * @param {number} [num] 1-based queue position (removable only)
+ * @returns {string}
+ */
+function indicatorHtml(state, num) {
+  const title = state === 'playing' ? 'Now playing' : 'Remove from queue';
+  const extra = state === 'playing' ? '' : REMOVE_SVG;
+  return `<div class="queue-indicator ${state}" title="${title}"><div class="q-plate"><div class="q-glyph"><span class="q-face">${faceHtml(state, num)}</span>${extra}</div></div></div>`;
+}
+
+/** Inner content of the wedge's face: play glyph or queue position. */
+function faceHtml(state, num) {
+  return state === 'playing' ? PLAY_SVG : String(num);
+}
+
+/** Identity of what a wedge displays, so changes can be detected and morphed. */
+function indicatorKey(el) {
+  if (!el) return '';
+  const face = el.querySelector('.q-face:not(.q-out)');
+  return `${el.classList.contains('playing') ? 'playing' : 'removable'}:${face ? face.textContent : ''}`;
+}
 
 /**
  * The row's stylesheet is identical for every <song-item>, so build it ONCE and share it
@@ -52,8 +75,8 @@ const SONG_ITEM_STYLE = `
     content-visibility: auto;
     contain-intrinsic-size: 0 73px;
   }
-  /* touch-action is set inline in render() — it depends on the working playlist, not
-     just the no-swipe attribute, so it can't be expressed as a static :host rule. */
+  /* touch-action is set inline in render() — it depends on whether this is the current
+     track, not just the no-swipe attribute, so it can't be a static :host rule. */
   :host(:last-child) { border-bottom: none; }
 
   /* Revealed action panel (sits behind the sliding content) */
@@ -63,67 +86,17 @@ const SONG_ITEM_STYLE = `
     z-index: 0;
     display: flex;
     align-items: center;
-    justify-content: flex-end;
-    padding-right: 72px;
+    justify-content: flex-start;
+    padding-left: 22px;
+    background: #1db954;
+    color: #fff;
+    font-size: 15px;
+    font-weight: 700;
+    white-space: nowrap;
     opacity: 0;
     transition: opacity 0.2s;
   }
-  .action-panel.add { background: #1db954; }
-  .action-panel.remove { background: #e53935; }
   .action-panel.visible { opacity: 1; }
-  .action-text {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    line-height: 1.15;
-    color: #fff;
-    font-weight: 700;
-    text-align: right;
-  }
-  .action-text span:first-child { font-size: 13px; opacity: 0.85; font-weight: 600; }
-  .action-text span:last-child {
-    font-size: 15px;
-    max-width: 160px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  /* Rotated playlist-icon triangle peeking from the right edge.
-     Side = cover height / √2 so the rotated square's diagonal equals the cover height. */
-  .pl-tab {
-    position: absolute;
-    top: 50%;
-    right: 0;
-    width: 39.6px;
-    height: 39.6px;
-    z-index: 3;
-    pointer-events: none;
-    border-radius: 0;
-    overflow: hidden;
-    transform-origin: center;
-    transform: translate(100%, -50%) rotate(45deg);
-    opacity: 0;
-    box-shadow: -2px 0 8px rgba(0, 0, 0, 0.35);
-    transition: transform 0.3s ease-out, opacity 0.25s;
-  }
-  .pl-tab.member { transform: translate(50%, -50%) rotate(45deg); opacity: 1; }
-  .pl-tab.dragging { transition: none; }
-  .pl-tab-inner {
-    width: 100%;
-    height: 100%;
-  }
-  .pl-tab-inner img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .pl-tab-inner .pl-default {
-    width: 100%;
-    height: 100%;
-    background: linear-gradient(145deg, #1db954 0%, #169c46 100%);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: rgba(255, 255, 255, 0.9);
-  }
-  .pl-tab-inner .pl-default svg { width: 18px; height: 18px; }
 
   /* Sliding foreground */
   .content {
@@ -173,7 +146,10 @@ const SONG_ITEM_STYLE = `
   /* Queue indicator — a wedge poking in from the track's left edge, mirroring the
      sloped "valley" of the centre nav tab: full-height at the left edge, its top
      and bottom edges sloping inward to a shorter right edge. Negative insets cancel
-     the .content padding (8px 10px) so it reaches the actual track edges. */
+     the .content padding (8px 10px) so it reaches the actual track edges.
+     Two layers on purpose: the outer box only slides (plain transform, no clip), the
+     inner .q-plate carries the clip-path and paint. Animating a transform on the clipped
+     element itself makes WebKit repaint the clip a frame behind — it flickers, then pops. */
   .queue-indicator {
     position: absolute;
     top: -8px;
@@ -181,6 +157,25 @@ const SONG_ITEM_STYLE = `
     left: -10px;
     width: 42px;
     z-index: 3;
+    font-size: 13px;
+    font-weight: 700;
+    color: #fff;
+    will-change: transform;
+  }
+  /* Even-paced curves on purpose: a strong ease-out covers most of the distance in the
+     first ~100ms (reads as "just appears"), a strong ease-in in the last ~100ms (reads
+     as "just vanishes"). These keep the travel visible for most of the run. */
+  .queue-indicator.entering { animation: wedge-in 0.55s cubic-bezier(0.3, 0.6, 0.3, 1) both; }
+  .queue-indicator.leaving {
+    animation: wedge-out 0.45s cubic-bezier(0.45, 0, 0.6, 0.6) forwards;
+    pointer-events: none;
+  }
+  @keyframes wedge-in { from { transform: translateX(-100%); } to { transform: none; } }
+  @keyframes wedge-out { from { transform: none; } to { transform: translateX(-100%); } }
+
+  .q-plate {
+    position: absolute;
+    inset: 0;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -192,17 +187,48 @@ const SONG_ITEM_STYLE = `
        plus ±8 insets). Top/bottom edges slope gently inward (~17%) to a shorter
        right edge; r=8 corners. Mirrors the centre nav tab's sloped valley. */
     clip-path: path('M0,8 Q0,0 7.5,2.7 L34.5,12.3 Q42,15 42,23 L42,65 Q42,73 34.5,75.7 L7.5,85.3 Q0,88 0,80 Z');
-    font-size: 13px;
-    font-weight: 700;
-    color: #fff;
+    /* Flat face with a metallic rim only: the clip path itself, stroked (half the
+       stroke falls inside the clip), lit along the top edge and shaded along the
+       bottom, with a softer wide stroke underneath for a slight bevel. */
+    background:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 42 88'%3E%3Cdefs%3E%3ClinearGradient id='r' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='white' stop-opacity='.6'/%3E%3Cstop offset='.4' stop-color='white' stop-opacity='.12'/%3E%3Cstop offset='.6' stop-color='black' stop-opacity='.12'/%3E%3Cstop offset='1' stop-color='black' stop-opacity='.45'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cg fill='none' stroke='url(%23r)'%3E%3Cpath stroke-width='6' opacity='.35' d='M0,8 Q0,0 7.5,2.7 L34.5,12.3 Q42,15 42,23 L42,65 Q42,73 34.5,75.7 L7.5,85.3 Q0,88 0,80 Z'/%3E%3Cpath stroke-width='2.5' d='M0,8 Q0,0 7.5,2.7 L34.5,12.3 Q42,15 42,23 L42,65 Q42,73 34.5,75.7 L7.5,85.3 Q0,88 0,80 Z'/%3E%3C/g%3E%3C/svg%3E")
+        0 0 / 100% 100% no-repeat,
+      var(--wedge-color, #2c2c2c);
+    transition: background-color 0.2s;
   }
-  .queue-indicator.playing { background: #1db954; }
-  .queue-indicator.removable { background: #282828; cursor: pointer; }
+  .queue-indicator.playing { --wedge-color: #1db954; }
+  .queue-indicator.removable { cursor: pointer; }
+
+  /* Glyph slot: number / icon. Holds two layers during a morph. */
+  .q-glyph {
+    position: relative;
+    display: grid;
+    place-items: center;
+    min-width: 18px;
+    height: 18px;
+    text-shadow: 0 1px 1px rgba(0,0,0,0.35);
+  }
+  .q-glyph > * { grid-area: 1 / 1; }
+  /* Block, not inline: an inline SVG sits on the text baseline and rides ~1.5px high. */
+  .q-glyph svg { display: block; }
+  .q-glyph .q-in  { animation: glyph-in 0.45s cubic-bezier(0.3, 0.7, 0.2, 1) both; }
+  .q-glyph .q-out { animation: glyph-out 0.35s ease-in forwards; }
+  @keyframes glyph-in {
+    from { opacity: 0; filter: blur(6px); transform: translateY(6px) scale(0.6); }
+    60%  { opacity: 1; filter: blur(1px); }
+    to   { opacity: 1; filter: blur(0); transform: none; }
+  }
+  @keyframes glyph-out {
+    to { opacity: 0; filter: blur(6px); transform: translateY(-6px) scale(1.4); }
+  }
   .queue-indicator.removable .q-remove { display: none; }
   @media (hover: hover) {
-    .queue-indicator.removable:hover { background: #c0392b; }
-    .queue-indicator.removable:hover .q-num { display: none; }
+    .queue-indicator.removable:hover { --wedge-color: #c0392b; }
+    .queue-indicator.removable:hover .q-glyph > :not(.q-remove) { display: none; }
     .queue-indicator.removable:hover .q-remove { display: block; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .queue-indicator, .q-glyph > * { animation: none !important; }
   }
 
   .details { flex: 1; min-width: 0; }
@@ -256,8 +282,6 @@ class SongItem extends HTMLElement {
     this.longPressThreshold = 15;
     this.longPressDelay = 500;
 
-    this.isToggling = false; // guard against double add/remove
-
     this._onMove = this.handleMove.bind(this);
     this._onEnd = this.handleEnd.bind(this);
   }
@@ -286,7 +310,7 @@ class SongItem extends HTMLElement {
         if (!this.isDragging) this.syncQueueIndicator();
         return;
       }
-      if (key === 'currentSong' || key === 'workingPlaylist' || key === 'playlists') {
+      if (key === 'currentSong') {
         if (!this.isDragging) this.render();
       }
     });
@@ -296,6 +320,7 @@ class SongItem extends HTMLElement {
     if (this.unsubscribeState) this.unsubscribeState();
     document.removeEventListener('mousemove', this._onMove);
     document.removeEventListener('mouseup', this._onEnd);
+    this.endSwipeVisuals();
   }
 
   /* ---------- data helpers ---------- */
@@ -312,20 +337,15 @@ class SongItem extends HTMLElement {
     return this.getAttribute('data-song-id') || this.songData.id;
   }
 
-  get workingPlaylist() {
-    return appState.get('workingPlaylist') || null;
+  /** Swipe-to-enqueue is live unless disabled, or the track is already playing. */
+  get swipeEnabled() {
+    return !this.hasAttribute('no-swipe') && this.songId != null && !this.isCurrentSong;
   }
 
-  get isMember() {
-    const wp = this.workingPlaylist;
-    if (!wp || !Array.isArray(wp.songs)) return false;
-    return wp.songs.some(s => String(s.id) === String(this.songId));
-  }
-
-  get membershipEnabled() {
-    const wp = this.workingPlaylist;
-    // Orphans is maintained by the server, so its membership can't be swiped.
-    return !this.hasAttribute('no-swipe') && !!wp && wp.kind !== 'orphans';
+  /** What a tap (and so a swipe) does to this track right now — mirrors MusicApp.enqueueSong. */
+  get enqueueLabel() {
+    const i = this.queueIndex;
+    return i < 0 ? 'add to queue' : i === 0 ? 'play now' : 'play next';
   }
 
   /** True when this row's track is the one currently loaded in the player. */
@@ -352,28 +372,84 @@ class SongItem extends HTMLElement {
     const isCurrent = this.isCurrentSong;
     const qIndex = this.queueIndex;
     const queued = qIndex >= 0;
-    let indicator = content.querySelector('.queue-indicator');
+    const indicator = content.querySelector('.queue-indicator:not(.leaving)');
 
     if (isCurrent) {
       // Current track's green badge is managed by render(); leave it untouched.
     } else if (queued) {
-      // Reuse the existing wedge if present, else insert one before the cover.
-      if (!indicator || !indicator.classList.contains('removable')) {
-        if (indicator) indicator.remove();
-        indicator = document.createElement('div');
-        content.insertBefore(indicator, content.firstChild);
+      if (indicator) {
+        // Position changed (or a stale playing badge) → morph the existing wedge in place.
+        this.morphIndicator(indicator, 'removable', qIndex + 1);
+      } else {
+        content.insertAdjacentHTML('afterbegin', indicatorHtml('removable', qIndex + 1));
+        this.enterIndicator(content.firstElementChild);
       }
-      indicator.className = 'queue-indicator removable';
-      indicator.title = 'Remove from queue';
-      indicator.innerHTML = `<span class="q-num">${qIndex + 1}</span>
-        <svg class="q-remove" viewBox="0 0 24 24" width="15" height="15" fill="#fff"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>`;
     } else if (indicator && indicator.classList.contains('removable')) {
-      // No longer queued → drop the wedge.
-      indicator.remove();
+      // No longer queued → slide the wedge back out to the left.
+      this.dismissIndicator(indicator);
     }
 
     const cover = this.shadowRoot.querySelector('.cover');
     if (cover) cover.classList.toggle('vinyl', isCurrent || queued);
+  }
+
+  /** Slide a freshly inserted wedge in from the left. */
+  enterIndicator(el) {
+    el.classList.add('entering');
+    const done = (e) => {
+      if (e.target !== el || e.animationName !== 'wedge-in') return;
+      // Drop the class so re-inserting this node (render reuse) can't replay the slide.
+      el.classList.remove('entering');
+      el.removeEventListener('animationend', done);
+    };
+    el.addEventListener('animationend', done);
+  }
+
+  /** Slide a wedge out to the left, then remove it. */
+  dismissIndicator(el) {
+    el.classList.remove('entering');
+    el.classList.add('leaving');
+    el.removeAttribute('title');
+    const remove = () => el.remove();
+    el.addEventListener('animationend', (e) => {
+      if (e.target === el && e.animationName === 'wedge-out') remove();
+    });
+    // Fallback for reduced motion / detached rows, where animationend never fires.
+    setTimeout(remove, 600);
+  }
+
+  /**
+   * Switch a wedge to a new state/number, morphing its face: the old glyph blurs up
+   * and out while the new one condenses in beneath it. No-op when nothing changed.
+   * @param {HTMLElement} el
+   * @param {'playing'|'removable'} state
+   * @param {number} [num]
+   */
+  morphIndicator(el, state, num) {
+    const nextKey = `${state}:${state === 'playing' ? '' : num}`;
+    if (indicatorKey(el) === nextKey) return;
+
+    const playing = state === 'playing';
+    el.classList.toggle('playing', playing);
+    el.classList.toggle('removable', !playing);
+    el.title = playing ? 'Now playing' : 'Remove from queue';
+
+    const glyph = el.querySelector('.q-glyph');
+    glyph.querySelectorAll('.q-face:not(.q-out)').forEach(old => {
+      old.classList.remove('q-in');
+      old.classList.add('q-out');
+      old.addEventListener('animationend', () => old.remove(), { once: true });
+      setTimeout(() => old.remove(), 400);
+    });
+    const face = document.createElement('span');
+    face.className = 'q-face q-in';
+    face.innerHTML = faceHtml(state, num);
+    face.addEventListener('animationend', () => face.classList.remove('q-in'), { once: true });
+    glyph.prepend(face);
+
+    const remove = glyph.querySelector('.q-remove');
+    if (playing && remove) remove.remove();
+    if (!playing && !remove) glyph.insertAdjacentHTML('beforeend', REMOVE_SVG);
   }
 
   /** Index of this track in the play queue, or -1. */
@@ -411,48 +487,24 @@ class SongItem extends HTMLElement {
     const queued = qIndex >= 0;
     const isVinyl = isCurrent || queued;
 
-    const wp = this.workingPlaylist;
-    const member = this.isMember;
-    const membershipUI = this.membershipEnabled;
+    const swipeUI = this.swipeEnabled;
 
     // Queue indicator overlay (left half of cover). Green play icon when playing,
     // grey position number (tap to remove) when queued.
-    let indicatorHtml = '';
-    if (isCurrent) {
-      indicatorHtml = `<div class="queue-indicator playing" title="Now playing">
-        <svg viewBox="0 0 24 24" width="15" height="15" fill="#fff"><path d="M8 5v14l11-7z"/></svg>
-      </div>`;
-    } else if (queued) {
-      indicatorHtml = `<div class="queue-indicator removable" title="Remove from queue">
-        <span class="q-num">${qIndex + 1}</span>
-        <svg class="q-remove" viewBox="0 0 24 24" width="15" height="15" fill="#fff"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
-      </div>`;
-    }
+    const indicatorState = isCurrent ? 'playing' : queued ? 'removable' : null;
+    const prevIndicator = this.shadowRoot.querySelector('.content > .queue-indicator:not(.leaving)');
 
-    // Playlist-membership triangle (rotated square of the working-playlist icon).
-    let tabHtml = '';
-    let panelHtml = '';
-    if (membershipUI) {
-      const tabInner = wp.icon
-        ? `<img src="${this.escHtml(wp.icon)}" alt="">`
-        : `<div class="pl-default"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z"/></svg></div>`;
-      tabHtml = `<div class="pl-tab"><div class="pl-tab-inner">${tabInner}</div></div>`;
+    // Text is filled in when a swipe starts, since the queue may have changed since render.
+    const panelHtml = swipeUI ? '<div class="action-panel"></div>' : '';
 
-      const verb = member ? 'remove from' : 'add to';
-      panelHtml = `<div class="action-panel ${member ? 'remove' : 'add'}">
-        <div class="action-text"><span>${this.escHtml(verb)}</span><span>${this.escHtml(wp.name || 'playlist')}</span></div>
-      </div>`;
-    }
-
-    // touch-action depends on whether the membership swipe is live (needs a working
-    // playlist), so it's set on the host inline rather than baked into the shared sheet.
-    this.style.touchAction = membershipUI ? 'pan-y' : 'manipulation';
+    // touch-action depends on whether the swipe is live, so it's set on the host inline
+    // rather than baked into the shared sheet.
+    this.style.touchAction = swipeUI ? 'pan-y' : 'manipulation';
 
     this.shadowRoot.innerHTML = `
       ${panelHtml}
-      ${tabHtml}
       <div class="content">
-        ${indicatorHtml}
+        ${indicatorState ? indicatorHtml(indicatorState, qIndex + 1) : ''}
         <div class="cover-wrap">
           <div class="cover ${isVinyl ? 'vinyl' : ''} ${isCurrent ? 'spinning' : ''} ${playing ? 'playing' : ''}">
             ${cover ? `<img src="${this.escHtml(cover)}" alt="Cover" loading="lazy" decoding="async">` : `<div class="no-cover">${sourceIcon}</div>`}
@@ -465,9 +517,28 @@ class SongItem extends HTMLElement {
       </div>
     `;
 
-    // Apply the triangle's resting state (member peeks in, non-member hidden off-right).
-    const tab = this.shadowRoot.querySelector('.pl-tab');
-    if (tab && member) tab.classList.add('member');
+    this.animateIndicatorChange(prevIndicator, indicatorState, qIndex + 1);
+    this.hasRendered = true;
+  }
+
+  /**
+   * After a full re-render, carry the wedge across instead of letting it pop: reuse the
+   * previous node (morphing its face if the state changed), slide a new one in, or slide
+   * a vanished one out. The very first render of a row never animates.
+   */
+  animateIndicatorChange(prev, state, num) {
+    if (!this.hasRendered) return;
+    const content = this.shadowRoot.querySelector('.content');
+    const next = content.querySelector('.queue-indicator');
+    if (prev && next) {
+      content.replaceChild(prev, next);
+      this.morphIndicator(prev, state, num);
+    } else if (next) {
+      this.enterIndicator(next);
+    } else if (prev) {
+      content.prepend(prev);
+      this.dismissIndicator(prev);
+    }
   }
 
   /* ---------- events ---------- */
@@ -579,14 +650,14 @@ class SongItem extends HTMLElement {
     if (!this.isDragging) return;
     const point = event.type === 'touchmove' ? event.touches[0] : event;
     this.currentX = point.clientX;
-    const dx = this.startX - point.clientX; // positive → leftward
+    const dx = point.clientX - this.startX; // positive → rightward
     const dy = point.clientY - this.startY;
 
     if (Math.hypot(dx, dy) > this.longPressThreshold) this.cancelLongPress();
 
     // Decide intent once: horizontal swipe vs vertical scroll
     if (!this.swiping) {
-      if (!this.membershipEnabled) {
+      if (!this.swipeEnabled) {
         // Any directional movement means this isn't a stationary long-press; cancel it
         // here (DIR_LOCK is smaller than longPressThreshold, so the check above can miss
         // it) before we stop tracking and let the browser scroll.
@@ -603,6 +674,9 @@ class SongItem extends HTMLElement {
       }
       if (Math.abs(dx) > DIR_LOCK) {
         this.swiping = true;
+        const panel = this.shadowRoot.querySelector('.action-panel');
+        if (panel) panel.textContent = this.enqueueLabel;
+        this.beginSwipeVisuals();
       } else {
         return;
       }
@@ -610,26 +684,43 @@ class SongItem extends HTMLElement {
 
     if (event.cancelable) event.preventDefault();
 
-    const distance = Math.max(0, Math.min(dx, MAX_SWIPE)); // only reveal leftward
+    const distance = Math.max(0, Math.min(dx, MAX_SWIPE)); // only reveal rightward
     this.isSwipe = distance > 5;
+    this.swipeX = distance;
+    // Touch/mouse moves can arrive faster than (and out of step with) paint; write the
+    // offset once per frame instead of on every event.
+    if (!this.swipeFrame) this.swipeFrame = requestAnimationFrame(() => this.paintSwipe());
+  }
 
+  /** Apply the latest drag offset (called from requestAnimationFrame). */
+  paintSwipe() {
+    this.swipeFrame = null;
     const content = this.shadowRoot.querySelector('.content');
     const panel = this.shadowRoot.querySelector('.action-panel');
-    const tab = this.shadowRoot.querySelector('.pl-tab');
-
-    content.classList.add('dragging');
-    content.style.transform = `translateX(-${distance}px)`;
-
-    if (panel) panel.classList.toggle('visible', distance > 12);
-
-    // Drag the triangle in from the right as you swipe to ADD (non-member).
-    if (tab && !this.isMember) {
-      tab.classList.add('dragging');
-      const progress = Math.min(distance / TAB_REVEAL, 1); // 0 → 1
-      const tx = 100 - 50 * progress;                       // 100% (hidden) → 50% (peek)
-      tab.style.transform = `translate(${tx}%, -50%) rotate(45deg)`;
-      tab.style.opacity = String(Math.min(progress * 1.5, 1));
+    if (content) {
+      content.classList.add('dragging');
+      content.style.transform = `translateX(${this.swipeX}px)`;
     }
+    if (panel) panel.classList.toggle('visible', this.swipeX > 12);
+  }
+
+  /**
+   * A swipe just locked in: give the sliding content its own compositor layer, so each
+   * frame is a pure GPU move rather than a repaint.
+   */
+  beginSwipeVisuals() {
+    clearTimeout(this.settleTimer);
+    const content = this.shadowRoot.querySelector('.content');
+    if (content) content.style.willChange = 'transform';
+  }
+
+  /** Undo beginSwipeVisuals once the row is at rest (or gone). */
+  endSwipeVisuals() {
+    cancelAnimationFrame(this.swipeFrame);
+    this.swipeFrame = null;
+    clearTimeout(this.settleTimer);
+    const content = this.shadowRoot.querySelector('.content');
+    if (content) content.style.willChange = '';
   }
 
   handleEnd() {
@@ -645,73 +736,39 @@ class SongItem extends HTMLElement {
     const wasSwiping = this.swiping;
     this.swiping = false;
 
-    const dx = this.startX - this.currentX;
+    const dx = this.currentX - this.startX;
 
-    if (wasSwiping && this.membershipEnabled && dx >= SWIPE_THRESHOLD) {
-      this.toggleMembership();
-    } else {
-      this.resetPosition();
-    }
+    this.resetPosition();
+    if (wasSwiping && this.swipeEnabled && dx >= SWIPE_THRESHOLD) this.enqueueFromSwipe();
 
     if (this.isSwipe) setTimeout(() => { this.isSwipe = false; }, 0);
   }
 
-  /** Snap content/triangle back to their resting positions. */
+  /** Snap the content back to its resting position. */
   resetPosition(immediate = false) {
+    cancelAnimationFrame(this.swipeFrame); // a frame still queued would re-apply the drag
+    this.swipeFrame = null;
     const content = this.shadowRoot.querySelector('.content');
     const panel = this.shadowRoot.querySelector('.action-panel');
-    const tab = this.shadowRoot.querySelector('.pl-tab');
     if (content) {
       if (!immediate) content.classList.remove('dragging');
       content.style.transform = '';
     }
     if (panel) panel.classList.remove('visible');
-    if (tab) {
-      tab.classList.remove('dragging');
-      tab.style.transform = '';
-      tab.style.opacity = '';
-    }
+    // Keep the layer through the snap-back transition, then drop it.
+    clearTimeout(this.settleTimer);
+    if (immediate) this.endSwipeVisuals();
+    else this.settleTimer = setTimeout(() => this.endSwipeVisuals(), SETTLE_MS);
   }
 
-  /** Commit an add/remove of the working playlist and animate accordingly. */
-  toggleMembership() {
-    if (this.isToggling) return;
-    this.isToggling = true;
-    setTimeout(() => { this.isToggling = false; }, 500);
-
-    const member = this.isMember;
-    const d = this.songData;
-    const song = {
-      id: d.id,
-      title: this.getAttribute('title') || d.title || 'Unknown',
-      artist: this.getAttribute('artist') || d.artist || 'Unknown',
-      cover: this.getAttribute('cover') || d.cover || '',
-      source: this.getAttribute('source') || d.source || 'unknown'
-    };
-
-    const content = this.shadowRoot.querySelector('.content');
-    const panel = this.shadowRoot.querySelector('.action-panel');
-    const tab = this.shadowRoot.querySelector('.pl-tab');
-
-    if (content) { content.classList.remove('dragging'); content.style.transform = ''; }
-    if (panel) panel.classList.remove('visible');
-
-    if (tab) {
-      tab.classList.remove('dragging');
-      if (member) {
-        // Removing → slide the triangle back off the right edge.
-        tab.classList.remove('member');
-        tab.style.transform = 'translate(100%, -50%) rotate(45deg)';
-        tab.style.opacity = '0';
-      } else {
-        // Adding → settle the triangle into its peeking position.
-        tab.classList.add('member');
-        tab.style.transform = '';
-        tab.style.opacity = '';
-      }
-    }
-
-    this.dispatchEvent(new CustomEvent(member ? 'remove-from-playlist' : 'add-to-playlist', {
+  /**
+   * A committed swipe does exactly what a tap does: hand the track to the host tab's
+   * enqueue path (MusicApp.enqueueSong — enqueue → move to front → play).
+   */
+  enqueueFromSwipe() {
+    const song = this.songData;
+    if (!song.id) return;
+    this.dispatchEvent(new CustomEvent('enqueue-song', {
       detail: { song }, bubbles: true, composed: true
     }));
   }

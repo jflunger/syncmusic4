@@ -89,6 +89,8 @@ def playlist_owned_by(conn, playlist_id, user):
     return row is not None
 
 ORPHANS_KIND = 'orphans'
+LIKES_NAME = 'Likes'
+LIKES_ICON = '/icons/likes-heart.svg'
 
 def is_orphans_playlist(conn, playlist_id):
     """True if the playlist is an auto-maintained Orphans playlist."""
@@ -111,7 +113,7 @@ def refresh_orphans(conn, user):
     else:
         orphans_id = conn.execute(
             'INSERT INTO playlists (name, owner, kind, description) VALUES (?, ?, ?, ?)',
-            ('Orphans', user, ORPHANS_KIND, 'Tracks that are not in any other playlist')
+            (LIKES_NAME, user, ORPHANS_KIND, 'Tracks that are not in any other playlist')
         ).lastrowid
 
     wanted = [r['id'] for r in conn.execute('''
@@ -135,7 +137,7 @@ def refresh_orphans(conn, user):
 
 def orphans_refusal():
     """Standard 400 for edits the auto-maintained Orphans playlist doesn't allow."""
-    return jsonify({'error': 'Orphans is maintained automatically'}), 400
+    return jsonify({'error': f'{LIKES_NAME} is maintained automatically'}), 400
 
 def yt_dlp_cookie_args(source):
     """
@@ -321,6 +323,37 @@ def migrate_add_start_end_time():
     conn.commit()
     conn.close()
 
+def migrate_add_song_duration():
+    """Add songs.duration (seconds of the whole audio file) if it doesn't exist."""
+    conn = get_db_connection()
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(songs)").fetchall()]
+    if 'duration' not in columns:
+        conn.execute('ALTER TABLE songs ADD COLUMN duration REAL')
+    conn.commit()
+    conn.close()
+
+def backfill_song_durations():
+    """Probe the audio of songs with no duration yet. Runs in a background thread at startup."""
+    from download_manager import probe_duration
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            'SELECT id, file_path FROM songs WHERE duration IS NULL AND file_path IS NOT NULL'
+        ).fetchall()
+        filled = 0
+        for row in rows:
+            if not os.path.isfile(row['file_path']):
+                continue
+            duration = probe_duration(row['file_path'])
+            if duration:
+                conn.execute('UPDATE songs SET duration = ? WHERE id = ?', (duration, row['id']))
+                conn.commit()
+                filled += 1
+        if rows:
+            print(f"[Durations] backfilled {filled}/{len(rows)} songs")
+    finally:
+        conn.close()
+
 def migrate_add_playlist_description():
     """Add description column to playlists table if it doesn't exist."""
     conn = get_db_connection()
@@ -412,11 +445,19 @@ def playlist_icon_url(icon_val):
     except OSError:
         return f"/{raw}"
     return f"/{raw}?v={version}"
+
+def playlist_public_icon(row):
+    """Icon URL for a playlist row: the fixed heart for Likes (the auto-maintained
+    'orphans' kind), otherwise its stored icon."""
+    if 'kind' in row.keys() and row['kind'] == ORPHANS_KIND:
+        return LIKES_ICON
+    return playlist_icon_url(row['icon'] if 'icon' in row.keys() else None)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Initialize database on startup
 init_db()
 migrate_add_start_end_time()
+migrate_add_song_duration()
 migrate_add_playlist_description()
 migrate_add_playlist_icon()
 migrate_add_playlist_owner()
@@ -489,6 +530,22 @@ def migrate_library_additions():
         conn.close()
 
 migrate_library_additions()
+
+def migrate_rename_orphans_to_likes():
+    """The auto-maintained 'orphans' playlist is now called Likes. Only renames
+    rows still carrying the old default name, so a user-chosen name survives."""
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE playlists SET name = ? WHERE kind = ? AND name = 'Orphans'",
+                     (LIKES_NAME, ORPHANS_KIND))
+        conn.commit()
+    finally:
+        conn.close()
+
+migrate_rename_orphans_to_likes()
+
+import threading
+threading.Thread(target=backfill_song_durations, name='duration-backfill', daemon=True).start()
 
 # Initialize SocketIO
 # async_mode='threading' lets Socket.IO run under a plain WSGI server (waitress)
@@ -960,10 +1017,11 @@ def get_playlists():
                 'download_link': song['download_link'],
                 'url': f'/audio/{os.path.basename(song["file_path"])}' if song['file_path'] else None,
                 'start_time': song['start_time'] if 'start_time' in song.keys() else None,
-                'end_time': song['end_time'] if 'end_time' in song.keys() else None
+                'end_time': song['end_time'] if 'end_time' in song.keys() else None,
+                'duration': song['duration']
             })
 
-        icon_url = playlist_icon_url(playlist['icon'] if 'icon' in playlist.keys() else None)
+        icon_url = playlist_public_icon(playlist)
         playlists_list.append({
             'id': playlist['id'],
             'name': playlist['name'],
@@ -1146,7 +1204,7 @@ def update_playlist(playlist_id):
             params.append(desc)
 
         if not updates:
-            icon_url = playlist_icon_url(playlist['icon'] if 'icon' in playlist.keys() else None)
+            icon_url = playlist_public_icon(playlist)
             return jsonify({
                 'id': playlist['id'],
                 'name': playlist['name'],
@@ -1159,7 +1217,7 @@ def update_playlist(playlist_id):
         conn.commit()
 
         updated = cursor.execute('SELECT * FROM playlists WHERE id = ?', (playlist_id,)).fetchone()
-        icon_url = playlist_icon_url(updated['icon'] if 'icon' in updated.keys() else None)
+        icon_url = playlist_public_icon(updated)
         return jsonify({
             'id': updated['id'],
             'name': updated['name'],

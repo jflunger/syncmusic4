@@ -17,6 +17,19 @@ import tempfile
 from datetime import datetime, timezone
 from typing import List, Dict, Any
 
+
+def probe_duration(path):
+    """Length of an audio file in seconds via ffprobe, or None if it can't be read."""
+    try:
+        out = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', path],
+            capture_output=True, text=True, timeout=20
+        ).stdout.strip()
+        return float(out) if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
 # A SoundCloud Go+ preview is ~30s. Any SoundCloud download shorter than this is
 # treated as a preview snippet rather than the full track, and (when a fallback
 # manager is wired up) retried through the DownCloudMe fallback.
@@ -617,10 +630,10 @@ class DownloadManager:
 
             os.rename(file_path, new_path)
 
-            # Update database with correct path
+            # Update database with correct path (and the new file's length)
             conn.execute(
-                'UPDATE songs SET file_path = ? WHERE id = ?',
-                (new_path, song_id)
+                'UPDATE songs SET file_path = ?, duration = ? WHERE id = ?',
+                (new_path, probe_duration(new_path), song_id)
             )
             conn.commit()
 

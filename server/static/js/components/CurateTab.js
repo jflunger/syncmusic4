@@ -10,6 +10,7 @@ import appState from '../state/appState.js';
 import { fetchSongs, fetchPlaylists, fetchEvergreens, fetchRecentAdditions } from '../services/api.js';
 import queueManager from '../services/QueueManager.js';
 import './PlaylistSettings.js';
+import { playlistCoversAttr, playlistPlaytime } from './PlaylistItem.js';
 
 // How many tiles "the grid" above the evergreens shows (a 5x5 square).
 const GRID_SIZE = 25;
@@ -91,6 +92,13 @@ class CurateTab extends HTMLElement {
           }
         }
         this.renderContent();
+      }
+      if (key === 'playFeeders') {
+        // Relight the feeder lenses in place; no need to rebuild the list.
+        const ids = value || [];
+        this.shadowRoot.querySelectorAll('playlist-item').forEach(item => {
+          item.setAttribute('feeder', String(ids.includes(parseInt(item.getAttribute('playlist-id'), 10))));
+        });
       }
     });
     this.playlists = appState.get('playlists');
@@ -250,7 +258,7 @@ class CurateTab extends HTMLElement {
     // Long-press a playlist on the Playlists subtab → open its settings menu.
     this.shadowRoot.addEventListener('playlist-settings-request', (event) => {
       const playlist = this.playlists.find(p => p.id === event.detail.playlistId);
-      if (playlist) this.openPlaylistSettings(playlist);
+      if (playlist) this.openPlaylistSettings(playlist, event.detail.origin);
     });
 
     // Membership add/remove (swipe on a track) is handled globally by MusicApp,
@@ -471,6 +479,7 @@ class CurateTab extends HTMLElement {
           flex-direction: column;
           gap: 10px;
           margin-top: 20px;
+          padding: 0 16px;        /* same gutter as the Play tab's feeder list */
         }
         /* Ghost "add playlist" card: dashed outline with a centered plus, sized
            to match a real playlist-item row so it reads as a placeholder slot. */
@@ -890,13 +899,17 @@ class CurateTab extends HTMLElement {
 
     const listEl = container.querySelector('.playlist-list');
 
+    const feederIds = appState.get('playFeeders') || [];
     const playlistsHtml = this.playlists.map(playlist =>
       `<playlist-item
         playlist-id="${playlist.id}"
         name="${(playlist.name || '').replace(/"/g, '&quot;')}"
         songs-count="${playlist.songs ? playlist.songs.length : 0}"
+        playtime="${playlistPlaytime(playlist)}"
+        feeder="${feederIds.includes(playlist.id)}"
         icon="${(playlist.icon || '').replace(/"/g, '&quot;')}"
-        swipe-left="add as feeder"
+        covers="${playlistCoversAttr(playlist)}"
+        swipe-right="add as feeder"
       ></playlist-item>`
     ).join('');
 
@@ -976,13 +989,21 @@ class CurateTab extends HTMLElement {
    * Open the playlist settings overlay.
    * @param {Object} [playlist=this.workingPlaylist] - Playlist to edit. Defaults
    *   to the working playlist; a long-press on the Playlists subtab passes its own.
+   * @param {Object} [origin] - { el, inset, radius } of the pressed card to grow out of
    */
-  openPlaylistSettings(playlist = this.workingPlaylist) {
+  openPlaylistSettings(playlist = this.workingPlaylist, origin = null) {
     if (!playlist) return;
     const targetId = playlist.id;
 
     const settings = document.createElement('playlist-settings');
     settings.setPlaylist(playlist);
+    if (origin) {
+      // Saving re-renders the list; let the sheet re-find the card to shrink back into.
+      settings.origin = {
+        ...origin,
+        resolve: () => this.shadowRoot.querySelector(`playlist-item[playlist-id="${targetId}"]`)
+      };
+    }
 
     settings.addEventListener('playlist-updated', (e) => {
       const updated = e.detail.playlist;
@@ -1015,9 +1036,10 @@ class CurateTab extends HTMLElement {
       }
     });
 
-    // Mount in music-app shadow root so overlay respects app boundaries (375×667)
-    const app = this.closest('music-app');
-    (app?.shadowRoot || this.shadowRoot).appendChild(settings);
+    // Mount beside the track editor in music-app's shadow root (this tab lives in it), so
+    // the fixed sheet isn't caught by any transform on the tab.
+    const root = this.getRootNode();
+    (root instanceof ShadowRoot ? root : this.shadowRoot).appendChild(settings);
   }
 
   /**

@@ -7,7 +7,7 @@
 
 import appState from '../state/appState.js';
 import './LiquidGlass.js';
-import './PlaylistItem.js';
+import { playlistCoversAttr, playlistPlaytime } from './PlaylistItem.js';
 
 // Fine scrubbing: dragging the finger down below the scrub slab slows the scrub, like
 // iOS. Bands by px below the grab point: [max dy, rate, label]. The page never scrolls
@@ -390,10 +390,12 @@ class PlayTab extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host { display: block; height: 100%; margin: 0; padding: 0; box-sizing: content-box; }
-        /* Spacer as tall as the bottom nav bar (70px) so the last item can be
-           scrolled clear of the bar instead of hiding behind it. */
+        /* Spacer so the last item can be scrolled clear of the bottom nav bar. Sized to
+           the bar's full box (100px incl. the now-playing disc, plus MusicApp's
+           --nav-lift) with 24px to spare — not its 70px visual height, and not relying on
+           the scroller's padding-bottom, which WebKit ignores in scroll containers. */
         .nav-spacer {
-          height: calc(70px + env(safe-area-inset-bottom, 0px));
+          height: calc(124px + var(--nav-lift, 0px) + env(safe-area-inset-bottom, 0px));
           flex: none;
         }
         /* Cover hero: a full-width square at the top of the page with the album
@@ -809,8 +811,11 @@ class PlayTab extends HTMLElement {
         playlist-id="${p.id}"
         name="${(p.name || '').replace(/"/g, '&quot;')}"
         songs-count="${p.songs ? p.songs.length : 0}"
+        playtime="${playlistPlaytime(p)}"
+        feeder="true"
         icon="${(p.icon || '').replace(/"/g, '&quot;')}"
-        swipe-right="remove as feeder"
+        covers="${playlistCoversAttr(p)}"
+        swipe-left="remove as feeder"
       ></playlist-item>`
     ).join('');
   }

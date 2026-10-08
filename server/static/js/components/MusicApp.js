@@ -247,10 +247,6 @@ class MusicApp extends HTMLElement {
     this.addEventListener('clear-queue', () => queueManager.clear());
     this.addEventListener('clear-history', () => queueManager.clearHistory());
 
-    // Toggle working-playlist membership (swipe on a track) — works in any tab.
-    this.addEventListener('add-to-playlist', (e) => this.togglePlaylistMembership(true, e.detail.song));
-    this.addEventListener('remove-from-playlist', (e) => this.togglePlaylistMembership(false, e.detail.song));
-
     // Play-tab feeder add/remove (swipe on a playlist-item) — works in any tab.
     this.addEventListener('feeder-add', (e) => this.onFeederAdd(e.detail.playlistId));
     this.addEventListener('feeder-remove', (e) => this.onFeederRemove(e.detail.playlistId));
@@ -408,7 +404,7 @@ class MusicApp extends HTMLElement {
         appState.set('workingPlaylist', updatedWp ? { ...updatedWp } : wp);
       }
 
-      // Membership changed, so the server-maintained Orphans playlist may have too.
+      // Membership changed, so the server-maintained Likes playlist may have too.
       fetchPlaylists().then(fresh => { if (fresh) appState.set('playlists', fresh); });
       return true;
     } catch (err) {
