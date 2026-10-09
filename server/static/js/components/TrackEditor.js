@@ -18,6 +18,7 @@
 
 import { updateSong, deleteSong, redownloadSong } from '../services/api.js';
 import appState from '../state/appState.js';
+import { icon as uiIcon } from '../icons.js';
 
 const MIN_GAP = 0.1;       // minimum seconds between start and end
 const PREVIEW_SECONDS = 3; // length of the start/end preview snippets
@@ -563,12 +564,12 @@ class TrackEditor extends HTMLElement {
 
                 <div class="section-label">Track</div>
                 <div class="card list">
-                  ${canShowRelated ? `<button class="row" id="related-btn"><span class="icon">🔗</span><span>Show related</span></button>` : ''}
+                  ${canShowRelated ? `<button class="row" id="related-btn"><span class="icon">${uiIcon('related-tracks')}</span><span>Show related</span></button>` : ''}
                   <button class="row" id="redownload-btn" ${!canSave ? 'disabled' : ''}>
-                    <span class="icon">🔄</span>
+                    <span class="icon">${uiIcon('re-download')}</span>
                     <span><span class="label">Re-download file</span><span class="sub">Re-fetch the audio if the wrong file got attached</span></span>
                   </button>
-                  <button class="row danger" id="delete-btn" ${!canSave ? 'disabled' : ''}><span class="icon">🗑</span><span>Delete track</span></button>
+                  <button class="row danger" id="delete-btn" ${!canSave ? 'disabled' : ''}><span class="icon">${uiIcon('delete')}</span><span>Delete track</span></button>
                 </div>
               </div>
             </div>
@@ -631,8 +632,8 @@ class TrackEditor extends HTMLElement {
       </div>
       <div class="range-ends"><span>0:00</span><span>${this.formatTime(this.duration)}</span></div>
       <p class="precision-hint">Drag a handle — move further above or below the bar for finer control.</p>
-      ${this.timeControlHtml('start', 'Start', `▶ First ${PREVIEW_SECONDS}s`)}
-      ${this.timeControlHtml('end', 'End', `▶ Last ${PREVIEW_SECONDS}s`)}
+      ${this.timeControlHtml('start', 'Start', `${uiIcon('play-preview')} First ${PREVIEW_SECONDS}s`)}
+      ${this.timeControlHtml('end', 'End', `${uiIcon('play-preview')} Last ${PREVIEW_SECONDS}s`)}
       <p class="units-hint">±10 / ±100 are milliseconds · m:ss.mmm</p>
     `;
 
@@ -1208,12 +1209,12 @@ class TrackEditor extends HTMLElement {
     if (startBtn) {
       const on = this.previewWhich === 'start';
       startBtn.classList.toggle('playing', on);
-      startBtn.textContent = on ? `⏸ Stop` : `▶ First ${PREVIEW_SECONDS}s`;
+      startBtn.innerHTML = on ? `${uiIcon('stop-preview')} Stop` : `${uiIcon('play-preview')} First ${PREVIEW_SECONDS}s`;
     }
     if (endBtn) {
       const on = this.previewWhich === 'end';
       endBtn.classList.toggle('playing', on);
-      endBtn.textContent = on ? `⏸ Stop` : `▶ Last ${PREVIEW_SECONDS}s`;
+      endBtn.innerHTML = on ? `${uiIcon('stop-preview')} Stop` : `${uiIcon('play-preview')} Last ${PREVIEW_SECONDS}s`;
     }
   }
 

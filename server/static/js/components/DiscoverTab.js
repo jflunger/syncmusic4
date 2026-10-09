@@ -6,12 +6,15 @@
  * none), then keeps the liked track on screen and playing: Like turns into Next, which is what
  * moves on to the following candidate.
  * Usage: <discover-tab></discover-tab>
- * Emits: 'enqueue-song' custom event with { detail: { song } }
+ * Emits: 'enqueue-song' custom event with { detail: { song } } — also for a tapped search/related
+ *        result, which is a pending (not yet downloaded) song until its download lands
  * API: showRelated(song) — open the Recommended subtab listing tracks related to a library song
  */
 
 import appState from '../state/appState.js';
+import { icon } from '../icons.js';
 import playback from '../services/PlaybackController.js';
+import { pendingSong } from '../services/QueueManager.js';
 import {
   searchSongs, downloadTrack, logout, fetchSongRelated,
   fetchDiscover, rateDiscover, redrawDiscover, fetchSongs, fetchPlaylists, addSongToPlaylist
@@ -32,13 +35,40 @@ const formatDuration = (ms) => {
 /** Escape text for use inside HTML content or a double-quoted attribute. */
 const esc = (v) => String(v ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+/**
+ * <search-result-item> markup for an online track (search hit or related track).
+ * @param {Object} t - Result with title/artist/source/cover/url and optional duration, metrics, library_song_id
+ * @returns {string} HTML
+ */
+const resultItemHtml = (t) => `
+  <search-result-item
+    title="${esc(t.title || 'Unknown')}"
+    artist="${esc(t.artist || 'Unknown')}"
+    source="${esc(t.source || 'unknown')}"
+    cover="${esc(t.cover || '')}"
+    url="${esc(t.url || '')}"
+    data-track="${esc(JSON.stringify({ duration: t.duration, metrics: t.metrics, library_song_id: t.library_song_id }))}"
+  ></search-result-item>`;
+
+const SEARCH_SVG = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>';
+
+/** Placeholder rows shown while a search runs. */
+const SKELETON_ROWS = Array.from({ length: 6 }, (_, i) => `
+  <div class="skeleton-row" style="--i:${i}">
+    <div class="sk sk-cover"></div>
+    <div class="sk-lines"><div class="sk sk-title"></div><div class="sk sk-artist"></div><div class="sk sk-meta"></div></div>
+    <div class="sk sk-btn"></div>
+  </div>`).join('');
+
 class DiscoverTab extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
     this.songs = [];
     this.searchResults = [];
-    this.searchTimeout = null;
+    this.searching = false;       // a search request is in flight
+    this.searchSeq = 0;           // bumps per search so a stale response is dropped
+    this.searchedQuery = null;    // query the current results belong to (null = none run yet)
     this.activeSubtab = 'recommended'; // 'recommended', 'search', or 'link'
     this.searchQuery = '';
     // Related-tracks lookup shown on the Recommended subtab:
@@ -187,6 +217,11 @@ class DiscoverTab extends HTMLElement {
     this.shadowRoot.addEventListener('download-track', (event) => {
       this.downloadSearchResult(event.detail.track);
     });
+
+    // Tapping a search/related row enqueues it (pending until downloaded)
+    this.shadowRoot.addEventListener('enqueue-track', (event) => {
+      this.enqueueSearchResult(event.detail.track, event.detail.librarySongId);
+    });
   }
 
   render() {
@@ -278,29 +313,102 @@ class DiscoverTab extends HTMLElement {
           border-color: var(--pill-border);
           color: #fff;
         }
+        /* Search bar: the 1.5px "border" is the form's background showing around the
+           input, so while searching it can become the app's blue/violet gradient and flow. */
+        .search-form {
+          position: relative;
+          margin: 4px 0 12px;
+          padding: 1.5px;
+          border-radius: 14px;
+          background: #3a3a3a;
+          transition: background 0.2s, box-shadow 0.3s;
+        }
+        .search-form:focus-within { background: #1db954; }
+        .search-form.searching {
+          background: linear-gradient(90deg, #5ac8ff, #8a7bff, #ff6b35, #8a7bff, #5ac8ff) 0 0 / 300% 100%;
+          box-shadow: 0 0 14px rgba(138, 123, 255, 0.45);
+          animation: search-flow 1.6s linear infinite;
+        }
+        @keyframes search-flow { to { background-position: 150% 0; } }
+        .search-glyph {
+          position: absolute;
+          left: 14px;
+          top: 50%;
+          width: 18px;
+          height: 18px;
+          margin-top: -9px;
+          color: #888;
+          pointer-events: none;
+          display: grid;
+          place-items: center;
+        }
+        .search-glyph svg { display: block; }
+        /* While searching the magnifier becomes a spinning ring */
+        .search-form.searching .search-glyph svg { display: none; }
+        .search-form.searching .search-glyph::after {
+          content: '';
+          width: 14px;
+          height: 14px;
+          border-radius: 50%;
+          border: 2px solid rgba(138, 123, 255, 0.25);
+          border-top-color: #8a7bff;
+          animation: search-spin 0.7s linear infinite;
+        }
+        @keyframes search-spin { to { transform: rotate(360deg); } }
         .search-input {
           -webkit-user-select: text;
           user-select: text;
           -webkit-touch-callout: default;
+          -webkit-appearance: none;
+          appearance: none;
+          display: block;
           width: 100%;
-          padding: 12px;
-          border: 1px solid #444;
-          background: #2a2a2a;
+          padding: 12px 14px 12px 42px;
+          border: none;
+          border-radius: 12.5px;
+          background: #161616;
           color: #fff;
-          border-radius: 8px;
           font-size: 16px;
-          margin-bottom: 8px;
           box-sizing: border-box;
         }
-        .search-input:focus {
-          outline: none;
-          border-color: #1db954;
+        .search-input:focus { outline: none; }
+        .search-input::placeholder { color: #666; }
+        /* Results run edge to edge, like the library lists */
+        .search-results { margin: 4px -20px 0; }
+        .result-list { display: flex; flex-direction: column; animation: results-in 0.35s ease-out; }
+        @keyframes results-in { from { opacity: 0; transform: translateY(8px); } }
+        .search-hint {
+          color: #777;
+          font-size: 14px;
+          text-align: center;
+          margin: 32px 20px;
         }
-        .search-results {
+        /* Skeleton rows: same geometry as <search-result-item>, with a shimmer sweep */
+        .skeleton-row {
           display: flex;
-          flex-direction: column;
-          gap: 0;
-          margin-top: 16px;
+          align-items: center;
+          gap: 12px;
+          padding: 8px 10px;
+          border-bottom: 1px solid #0a0a0a;
+          animation: skeleton-in 0.3s ease-out both;
+          animation-delay: calc(var(--i) * 60ms);
+        }
+        @keyframes skeleton-in { from { opacity: 0; } }
+        .sk {
+          background: linear-gradient(90deg, #1a1a1a 0%, #1a1a1a 35%, #2c2c2c 50%, #1a1a1a 65%, #1a1a1a 100%) 0 0 / 300% 100%;
+          animation: shimmer 1.3s linear infinite;
+          animation-delay: calc(var(--i) * 90ms);
+          border-radius: 4px;
+        }
+        @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -50% 0; } }
+        .sk-cover { width: 56px; height: 56px; border-radius: 0; flex-shrink: 0; }
+        .sk-lines { flex: 1; display: flex; flex-direction: column; gap: 7px; }
+        .sk-title { height: 13px; width: 70%; }
+        .sk-artist { height: 11px; width: 42%; }
+        .sk-meta { height: 9px; width: 30%; }
+        .sk-btn { width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; }
+        @media (prefers-reduced-motion: reduce) {
+          .search-form.searching, .sk { animation-duration: 4s; }
         }
         /* ---- Discover candidate card ---- */
         .discover-card {
@@ -1028,15 +1136,7 @@ class DiscoverTab extends HTMLElement {
       return `${header}<p class="coming-soon">${note || 'No related tracks found.'}</p>`;
     }
 
-    const items = r.results.map((t) => `
-      <search-result-item
-        title="${esc(t.title || 'Unknown')}"
-        artist="${esc(t.artist || 'Unknown')}"
-        source="${esc(t.source)}"
-        cover="${esc(t.cover)}"
-        url="${esc(t.url)}"
-      ></search-result-item>
-      <div class="related-metrics">${this.formatMetrics(t)}</div>`).join('');
+    const items = r.results.map(resultItemHtml).join('');
     return `${header}${note ? `<p class="coming-soon">${note}</p>` : ''}<div class="related-list">${items}</div>`;
   }
 
@@ -1065,12 +1165,12 @@ class DiscoverTab extends HTMLElement {
   formatMetrics(track) {
     const m = track.metrics || {};
     const chips = [];
-    if (track.library_song_id) chips.push('<span class="in-library">✓ In library</span>');
-    if (track.duration) chips.push(`⏱ ${formatDuration(track.duration)}`);
-    if (m.plays != null) chips.push(`▶ ${compactNumber.format(m.plays)}`);
+    if (track.library_song_id) chips.push(`<span class="in-library">${icon('in-library')} In library</span>`);
+    if (track.duration) chips.push(`${icon('duration')} ${formatDuration(track.duration)}`);
+    if (m.plays != null) chips.push(`${icon('play-count')} ${compactNumber.format(m.plays)}`);
     if (m.likes != null) {
       const ratio = m.like_ratio != null ? ` (${(m.like_ratio * 100).toFixed(1)}%)` : '';
-      chips.push(`♥ ${compactNumber.format(m.likes)}${ratio}`);
+      chips.push(`${icon('like-count')} ${compactNumber.format(m.likes)}${ratio}`);
     }
     if (m.plays_per_day != null) chips.push(`${compactNumber.format(m.plays_per_day)}/day`);
     if (m.uploaded_at) chips.push(String(m.uploaded_at).slice(0, 4));
@@ -1138,19 +1238,24 @@ class DiscoverTab extends HTMLElement {
 
     container.innerHTML = `
       <div class="search-section">
+        <form class="search-form ${this.searching ? 'searching' : ''}" role="search">
+          <span class="search-glyph" aria-hidden="true">${SEARCH_SVG}</span>
+          <input type="search" class="search-input" placeholder="Search YouTube & SoundCloud" enterkeyhint="search"
+            autocomplete="off" autocorrect="off" spellcheck="false" value="${esc(this.searchQuery)}">
+        </form>
         <div class="source-pills">${pills}</div>
-        <input type="text" class="search-input" placeholder="Search songs..." value="${this.searchQuery.replace(/"/g, '&quot;')}">
         <div class="search-results"></div>
       </div>
     `;
 
     const searchInput = container.querySelector('.search-input');
-    if (searchInput) {
-      searchInput.addEventListener('input', (e) => {
-        this.searchQuery = e.target.value;
-        this.handleSearch(this.searchQuery.trim());
-      });
-    }
+    searchInput.addEventListener('input', (e) => { this.searchQuery = e.target.value; });
+    // Search runs only on Enter (form submit), never while typing.
+    container.querySelector('.search-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      searchInput.blur();   // drop the on-screen keyboard so the results are visible
+      this.handleSearch(this.searchQuery.trim());
+    });
 
     this.renderSearchResults();
   }
@@ -1238,33 +1343,35 @@ class DiscoverTab extends HTMLElement {
   }
 
   /**
-   * Handle search input with debouncing
+   * Run a search (on Enter). An empty query clears the results; a newer search
+   * supersedes one still in flight.
    * @param {string} query - Search query
    */
-  handleSearch(query) {
-    if (this.searchTimeout) {
-      clearTimeout(this.searchTimeout);
-    }
-
+  async handleSearch(query) {
+    const seq = ++this.searchSeq;
     if (!query) {
       this.searchResults = [];
-      this.renderSearchResults();
+      this.searchedQuery = null;
+      this.setSearching(false);
       return;
     }
 
-    this.searchTimeout = setTimeout(async () => {
-      try {
-        this.showMessage('Searching...', 'info');
-        const results = await searchSongs(query);
-        this.searchResults = results || [];
-        this.renderSearchResults();
-        this.clearMessage();
-      } catch (error) {
-        this.showMessage('Search failed', 'error');
-        this.searchResults = [];
-        this.renderSearchResults();
-      }
-    }, 500);
+    this.setSearching(true);
+    const results = await searchSongs(query);   // resolves to [] on failure
+    if (seq !== this.searchSeq) return;
+    this.searchResults = results || [];
+    this.searchedQuery = query;
+    this.setSearching(false);
+  }
+
+  /**
+   * Toggle the searching animation (input glow + skeleton rows) and redraw the results.
+   * @param {boolean} on
+   */
+  setSearching(on) {
+    this.searching = on;
+    this.shadowRoot.querySelector('.search-form')?.classList.toggle('searching', on);
+    this.renderSearchResults();
   }
 
   /**
@@ -1307,25 +1414,25 @@ class DiscoverTab extends HTMLElement {
     const resultsEl = this.shadowRoot.querySelector('.search-results');
     if (!resultsEl) return;
 
-    const filtered = this.searchResults.filter(r =>
-      this.selectedSources.has((r.source || '').toLowerCase())
-    );
-
-    if (filtered.length === 0) {
-      resultsEl.innerHTML = '';
+    if (this.searching) {
+      resultsEl.innerHTML = SKELETON_ROWS;
+      return;
+    }
+    if (this.searchedQuery == null) {
+      resultsEl.innerHTML = '<p class="search-hint">Type a song or artist and press Enter.</p>';
       return;
     }
 
-    const interleaved = this.interleaveResults(filtered);
-    resultsEl.innerHTML = interleaved.map(result =>
-      `<search-result-item
-        title="${result.title || 'Unknown'}"
-        artist="${result.artist || 'Unknown'}"
-        source="${result.source || 'unknown'}"
-        cover="${result.cover || ''}"
-        url="${result.url || ''}"
-      ></search-result-item>`
-    ).join('');
+    const filtered = this.searchResults.filter(r =>
+      this.selectedSources.has((r.source || '').toLowerCase())
+    );
+    if (filtered.length === 0) {
+      const why = this.searchResults.length ? 'with the selected sources' : `for “${esc(this.searchedQuery)}”`;
+      resultsEl.innerHTML = `<p class="search-hint">No results ${why}.</p>`;
+      return;
+    }
+
+    resultsEl.innerHTML = `<div class="result-list">${this.interleaveResults(filtered).map(resultItemHtml).join('')}</div>`;
   }
 
   /**
@@ -1333,19 +1440,34 @@ class DiscoverTab extends HTMLElement {
    * @param {Object} track - Track object with title, artist, source, url, cover
    */
   async downloadSearchResult(track) {
+    // Progress shows on the row's own button (driven by downloadStatuses), so only
+    // failures to queue get a banner.
     try {
-      this.showMessage(`Downloading "${track.title}"...`, 'info');
       const result = await downloadTrack(track.url, track.source, track);
-      if (result.success) {
-        this.showMessage(`Downloaded "${track.title}"!`, 'success');
-        // Reload songs to include new downloads
-        this.loadSongs();
-      } else {
-        this.showMessage('Download completed but no files found', 'warning');
-      }
+      if (!result.success) this.showMessage(`Couldn't queue "${track.title}"`, 'warning');
     } catch (error) {
       this.showMessage(`Download failed: ${error.message}`, 'error');
     }
+  }
+
+  /**
+   * Enqueue a search result. A track already in the library goes in as that song; otherwise
+   * it goes in as a pending entry (the player skips it until it's downloaded) and its
+   * download is started if it isn't already under way. Repeat taps follow the usual
+   * enqueue → move-to-front → play cycle in MusicApp.enqueueSong.
+   * @param {Object} track - { title, artist, source, url, cover }
+   * @param {number|null} librarySongId - Library id from the search result, if known
+   */
+  enqueueSearchResult(track, librarySongId) {
+    const songs = appState.get('songs') || [];
+    const librarySong = songs.find(s => (librarySongId ? s.id === librarySongId : s.download_link === track.url) && s.url);
+    this.dispatchEvent(new CustomEvent('enqueue-song', {
+      detail: { song: librarySong || pendingSong(track) },
+      bubbles: true
+    }));
+    if (librarySong) return;
+    const status = (appState.get('downloadStatuses') || {})[track.url];
+    if (!['queued', 'downloading', 'completed'].includes(status)) this.downloadSearchResult(track);
   }
 
   /**
@@ -1361,9 +1483,6 @@ class DiscoverTab extends HTMLElement {
   disconnectedCallback() {
     if (this.unsubscribeSongs) {
       this.unsubscribeSongs();
-    }
-    if (this.searchTimeout) {
-      clearTimeout(this.searchTimeout);
     }
     this.preview.pause();
   }

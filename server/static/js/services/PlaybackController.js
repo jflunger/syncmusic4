@@ -169,12 +169,13 @@ class PlaybackController {
   }
 
   /**
-   * Whether a song is eligible to be played/queued as "next": it has a URL and hasn't failed.
+   * Whether a song is eligible to be played/queued as "next": it has a URL, isn't a pending
+   * (still downloading) queue entry, and hasn't failed.
    * @param {Object|null} song
    * @returns {boolean}
    */
   isPlayable(song) {
-    return !!(song && song.url) && !this.failedSongs.has(song.id);
+    return !!(song && song.url && !song.pending) && !this.failedSongs.has(song.id);
   }
 
   // ---------------------------------------------------------------------------

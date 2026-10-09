@@ -16,6 +16,13 @@ class QueueManager {
     this.history = []; // Previously played songs, max 100
     this._saveTimer = null; // Trailing-debounce handle for queue saves
     this.loadState();
+    // Pending tracks (enqueued from search before they're downloaded) turn into the real
+    // library song once the download lands — the songs refresh after 'download_completed'
+    // is what makes that visible — and are dropped if their download fails.
+    appState.subscribe((key, value) => {
+      if (key === 'songs') this.resolvePending(value);
+      if (key === 'downloadStatuses') this.dropFailedPending(value);
+    });
     // A burst of enqueues should collapse into one save; flush any pending save if the
     // page is being unloaded so the last change isn't lost inside the debounce window.
     window.addEventListener('beforeunload', () => this.flushSave());
@@ -28,6 +35,7 @@ class QueueManager {
     try {
       this.queue = await loadQueue();
       this.appState.set('queue', [...this.queue]);
+      this.resolvePending(this.appState.get('songs'));
     } catch (error) {
       console.error('Failed to load queue:', error);
       this.queue = [];
@@ -186,6 +194,38 @@ class QueueManager {
   }
 
   /**
+   * Swap every pending entry whose download has landed for its library song, in place. If
+   * that song is already queued elsewhere the pending copy is just dropped.
+   * @param {Array<Object>} songs - The library (appState 'songs')
+   */
+  resolvePending(songs) {
+    if (!this.queue.some(s => s.pending) || !songs?.length) return;
+    const byLink = new Map(songs.filter(s => s.download_link && s.url).map(s => [s.download_link, s]));
+    let changed = false;
+    const ids = new Set(this.queue.filter(s => !s.pending).map(s => String(s.id)));
+    this.queue = this.queue.flatMap((entry) => {
+      const song = entry.pending && byLink.get(entry.download_link);
+      if (!song) return [entry];
+      changed = true;
+      if (ids.has(String(song.id))) return [];
+      ids.add(String(song.id));
+      return [song];
+    });
+    if (changed) this._commit();
+  }
+
+  /**
+   * Remove pending entries whose download failed — they can never become playable.
+   * @param {Object} statuses - appState 'downloadStatuses' (download_link → status)
+   */
+  dropFailedPending(statuses) {
+    const keep = this.queue.filter(s => !(s.pending && statuses?.[s.download_link] === 'failed'));
+    if (keep.length === this.queue.length) return;
+    this.queue = keep;
+    this._commit();
+  }
+
+  /**
    * Push the current queue everywhere it needs to go: the reactive store (drives every
    * song-item indicator + the Play tab list), the server, and other clients via socket.
    */
@@ -261,6 +301,26 @@ class QueueManager {
       socket.emit('queue_updated', { queue: this.queue });
     }
   }
+}
+
+/**
+ * Queue entry for a search result that isn't downloaded yet. The player skips it until the
+ * download finishes and resolvePending swaps in the real song. The id is derived from the
+ * link (same shape the server returns from /api/queue/load) so repeat taps find it.
+ * @param {Object} track - Search result: { title, artist, source, url, cover }
+ * @returns {Object} Pending song
+ */
+export function pendingSong(track) {
+  return {
+    id: `pending:${track.url}`,
+    pending: true,
+    title: track.title,
+    artist: track.artist,
+    cover: track.cover || null,
+    source: track.source,
+    download_link: track.url,
+    url: null,
+  };
 }
 
 // Create singleton instance

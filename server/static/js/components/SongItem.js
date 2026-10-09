@@ -13,6 +13,9 @@
  *                             Playlist membership lives in the track editor's flip menu.
  *  - Long-press (library)   → edit (emits 'track-edit-request' { song, origin }).
  *
+ * A pending entry (data-song has pending: true — enqueued from search, not downloaded yet) is
+ * dimmed with a "Downloading" note; the player skips it until the download lands.
+ *
  * Attributes:
  *  - no-swipe : disable the enqueue swipe gesture (tap + queue indicator still work).
  *
@@ -21,6 +24,7 @@
  */
 
 import appState from '../state/appState.js';
+import { icon } from '../icons.js';
 
 const MAX_SWIPE = 160;       // px the content can slide while swiping (wide enough to read the action text)
 const SWIPE_THRESHOLD = 80;  // px past which a swipe enqueues (same cutoff as playlist-item)
@@ -232,6 +236,16 @@ const SONG_ITEM_STYLE = `
   }
 
   .details { flex: 1; min-width: 0; }
+  /* Pending queue entry: enqueued from search, still downloading — skipped until it lands */
+  .content.pending .cover-wrap, .content.pending .title, .content.pending .artist { opacity: 0.55; }
+  .pending-note {
+    margin: 3px 0 0;
+    font-size: 12px;
+    color: #64b5f6;
+    animation: pending-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pending-pulse { 50% { opacity: 0.45; } }
+  @media (prefers-reduced-motion: reduce) { .pending-note { animation: none; } }
   .title {
     font-weight: 600;
     margin: 0 0 4px 0;
@@ -470,6 +484,22 @@ class SongItem extends HTMLElement {
     return div.innerHTML;
   }
 
+  /** True for a pending queue entry (enqueued from search, still downloading). */
+  get isPending() {
+    return !!this.songData.pending;
+  }
+
+  /* ---------- render hooks (subclasses, e.g. <search-result-item>, fill these) ---------- */
+
+  /** @returns {string} Extra markup overlaid on the cover (inside .cover-wrap). */
+  coverExtraHtml() { return ''; }
+
+  /** @returns {string} Extra lines under the artist. */
+  detailsExtraHtml() { return ''; }
+
+  /** @returns {string} Markup after the details, at the row's right edge. */
+  trailingHtml() { return ''; }
+
   /* ---------- render ---------- */
 
   render() {
@@ -477,7 +507,7 @@ class SongItem extends HTMLElement {
     const artist = this.getAttribute('artist') || this.songData.artist || 'Unknown';
     const cover = this.getAttribute('cover') || this.songData.cover || '';
     const source = (this.getAttribute('source') || this.songData.source || 'unknown').toLowerCase();
-    const sourceIcon = source === 'spotify' ? '🎵' : source === 'soundcloud' ? '🎧' : '📁';
+    const sourceIcon = icon(source === 'spotify' ? 'spotify-source' : source === 'soundcloud' ? 'soundcloud-source' : 'local-file');
 
     const currentSong = appState.get('currentSong');
     const isCurrent = this.songId != null && currentSong && String(currentSong.id) === String(this.songId);
@@ -486,6 +516,7 @@ class SongItem extends HTMLElement {
     const qIndex = this.queueIndex;
     const queued = qIndex >= 0;
     const isVinyl = isCurrent || queued;
+    const pending = this.isPending;
 
     const swipeUI = this.swipeEnabled;
 
@@ -503,17 +534,21 @@ class SongItem extends HTMLElement {
 
     this.shadowRoot.innerHTML = `
       ${panelHtml}
-      <div class="content">
+      <div class="content ${pending ? 'pending' : ''}">
         ${indicatorState ? indicatorHtml(indicatorState, qIndex + 1) : ''}
         <div class="cover-wrap">
           <div class="cover ${isVinyl ? 'vinyl' : ''} ${isCurrent ? 'spinning' : ''} ${playing ? 'playing' : ''}">
             ${cover ? `<img src="${this.escHtml(cover)}" alt="Cover" loading="lazy" decoding="async">` : `<div class="no-cover">${sourceIcon}</div>`}
           </div>
+          ${this.coverExtraHtml()}
         </div>
         <div class="details">
           <h4 class="title">${this.escHtml(title)}</h4>
           <p class="artist"><span class="source-dot ${source}"></span>${this.escHtml(artist)}</p>
+          ${pending ? '<p class="pending-note">Downloading · plays once ready</p>' : ''}
+          ${this.detailsExtraHtml()}
         </div>
+        ${this.trailingHtml()}
       </div>
     `;
 
@@ -775,3 +810,5 @@ class SongItem extends HTMLElement {
 }
 
 customElements.define('song-item', SongItem);
+
+export default SongItem;

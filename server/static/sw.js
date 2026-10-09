@@ -6,13 +6,14 @@
 // asset. The fetch handler is cache-first, so clients keep serving the old copy until
 // CACHE_NAME changes — forgetting this is how the iOS PWA fullscreen fix keeps "regressing"
 // even when the source files are correct. See docs/ios-pwa-fullscreen.md.
-const CACHE_NAME = 'syncmusic-v66';
+const CACHE_NAME = 'syncmusic-v70';
 const CACHE_FILES = [
   '/',
   '/index.html',
   '/css/styles.css',
   '/js/state/appState.js',
   '/js/services/api.js',
+  '/js/icons.js',
   '/js/components/MusicApp.js',
   '/js/components/DiscoverTab.js',
   '/js/components/PlayTab.js',

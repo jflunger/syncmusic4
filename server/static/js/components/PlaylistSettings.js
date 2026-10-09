@@ -15,6 +15,7 @@
  */
 
 import appState from '../state/appState.js';
+import { icon as uiIcon } from '../icons.js';
 import {
   updatePlaylist, deletePlaylist, uploadPlaylistIcon, usePlaylistFeederIcon, removePlaylistIcon,
   fetchFeeders, addFeeder, removeFeeder, triggerSync, fetchSyncStatus,
@@ -490,7 +491,7 @@ class PlaylistSettings extends HTMLElement {
 
                 <div class="section-label">Playlist</div>
                 <div class="card list">
-                  <button class="row danger" id="delete-btn"><span class="icon">🗑</span><span>Delete playlist</span></button>
+                  <button class="row danger" id="delete-btn"><span class="icon">${uiIcon('delete')}</span><span>Delete playlist</span></button>
                 </div>`}
               </div>
             </div>
@@ -590,11 +591,11 @@ class PlaylistSettings extends HTMLElement {
     const hasFeederCovers = this.feeders.some(f => f.thumbnail);
     card.innerHTML = `
       <input type="file" id="icon-input" accept="image/jpeg,image/png,image/webp,image/gif" hidden>
-      <button class="row" id="upload-icon-btn"><span class="icon">🖼</span><span>Upload icon</span></button>
-      ${hasFeederCovers ? `<button class="row" id="use-feeder-icon-btn"><span class="icon">🎞</span>
+      <button class="row" id="upload-icon-btn"><span class="icon">${uiIcon('upload-icon')}</span><span>Upload icon</span></button>
+      ${hasFeederCovers ? `<button class="row" id="use-feeder-icon-btn"><span class="icon">${uiIcon('feeder-cover')}</span>
         <span><span>Use a feeder cover</span><span class="sub">Pick one of the feeder playlists' covers</span></span></button>
         <div class="picker" id="picker"></div>` : ''}
-      ${icon ? '<button class="row danger" id="remove-icon-btn"><span class="icon">✕</span><span>Remove icon</span></button>' : ''}
+      ${icon ? `<button class="row danger" id="remove-icon-btn"><span class="icon">${uiIcon('remove')}</span><span>Remove icon</span></button>` : ''}
     `;
   }
 
@@ -708,10 +709,10 @@ class PlaylistSettings extends HTMLElement {
       <div class="row">
         ${f.thumbnail ? `<img class="thumb" src="${esc(f.thumbnail)}" alt="">` : '<span class="thumb"></span>'}
         <span class="row-text"><span class="row-name">${esc(f.name || 'Unknown')}</span><span class="sub">${esc(f.source)}</span></span>
-        <button class="feeder-remove" data-remove="${f.id}" aria-label="Remove feeder">&times;</button>
+        <button class="feeder-remove" data-remove="${f.id}" aria-label="Remove feeder">${uiIcon('remove')}</button>
       </div>`).join('');
     box.innerHTML = (rows || '<p class="muted">No feeder playlists yet</p>')
-      + '<button class="row accent" id="add-feeder-btn"><span class="icon">＋</span><span>Add feeder playlist</span></button>';
+      + `<button class="row accent" id="add-feeder-btn"><span class="icon">${uiIcon('add')}</span><span>Add feeder playlist</span></button>`;
 
     this.renderSyncButton();
   }

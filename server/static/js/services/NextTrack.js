@@ -1,7 +1,8 @@
 /**
  * NextTrack - the single source of truth for "what plays next".
  *
- * It mirrors MusicApp.playNext exactly: the playable head of the queue, else a *random* song
+ * It mirrors MusicApp.playNext exactly: the first playable song in the queue (pending tracks —
+ * enqueued from search, still downloading — are skipped over, keeping their place), else a *random* song
  * from a random eligible feeder playlist, else nothing. The key difference from resolving at
  * play time is that the random feeder pick is computed up front on a fork of a seedable RNG
  * (see Rng.js), so peek() returns the very song that will play — and only when that song is
@@ -77,7 +78,7 @@ class NextTrack extends EventTarget {
     if (!song) return null;
 
     if (this._source === 'queue') {
-      queueManager.dequeue();                 // removes the head we just handed out
+      queueManager.removeById(song.id);       // removes the entry we handed out (may sit behind pending ones)
     } else if (this._source === 'feeder' && this._pendingState != null) {
       this.rng.setState(this._pendingState);  // commit the draws → next fork starts fresh
     }
@@ -100,20 +101,21 @@ class NextTrack extends EventTarget {
   }
 
   /**
-   * Re-resolve the next track. The playable queue head always wins and is deterministic, so it
-   * is recomputed cheaply every time. When the queue is empty the next track is a *random*
+   * Re-resolve the next track. The first playable queued song always wins and is deterministic,
+   * so it is recomputed cheaply every time (an unplayable entry, e.g. a pending download, is
+   * passed over rather than blocking the queue). When the queue is empty the next track is a *random*
    * feeder pick — we keep an existing valid pick rather than re-rolling on every unrelated
    * input change (e.g. a playlists refresh from a sync download), which would make the preview
    * flicker and thrash the preloader. Dispatches 'change' only when the resolved track changes.
    */
   recompute() {
-    const head = queueManager.queue[0];
-    if (head && this.isPlayable(head)) {
+    const head = queueManager.queue.find((s) => this.isPlayable(s));
+    if (head) {
       this._set(head, 'queue', null);
       return;
     }
 
-    // Queue empty: hold the current feeder pick if it's still a valid choice.
+    // No playable queued song: hold the current feeder pick if it's still a valid choice.
     if (this._source === 'feeder' && this._next && this._stillEligibleFeeder(this._next)) {
       return;
     }

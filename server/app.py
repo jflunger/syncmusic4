@@ -464,6 +464,38 @@ migrate_add_playlist_owner()
 migrate_add_playlist_kind()
 migrate_queue_per_account()
 
+def migrate_queue_pending():
+    """Let the queue hold "pending" tracks: enqueued straight from search while
+    their download is still running. Such a row has no song_id yet — it carries
+    the track's download_link (pending_link) and display metadata (pending_data,
+    JSON) until the download lands and it is resolved to the new song. song_id
+    is NOT NULL in the old table, so it is rebuilt (rows are copied)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(queue)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if 'pending_link' not in columns:
+        cursor.execute('''
+            CREATE TABLE queue_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                song_id INTEGER,
+                position INTEGER NOT NULL,
+                owner TEXT NOT NULL,
+                pending_link TEXT,
+                pending_data TEXT,
+                FOREIGN KEY (song_id) REFERENCES songs (id) ON DELETE CASCADE,
+                UNIQUE(owner, position)
+            )
+        ''')
+        cursor.execute('INSERT INTO queue_new (id, song_id, position, owner) '
+                       'SELECT id, song_id, position, owner FROM queue')
+        cursor.execute('DROP TABLE queue')
+        cursor.execute('ALTER TABLE queue_new RENAME TO queue')
+    conn.commit()
+    conn.close()
+
+migrate_queue_pending()
+
 import related_tracks
 _conn = get_db_connection()
 related_tracks.migrate_related_tables(_conn)
@@ -1959,7 +1991,9 @@ def search_songs():
                         'duration': duration,
                         'url': webpage_url,
                         'cover': cover,
-                        'source': 'youtube'
+                        'source': 'youtube',
+                        # Flat search entries carry the view count but no likes/upload date.
+                        'metrics': related_tracks._derive_metrics({'plays': video.get('view_count')})
                     })
                     count += 1
         except Exception as e:
@@ -1976,32 +2010,27 @@ def search_songs():
                 if count >= 10:  # Limit to 10 results from SoundCloud
                     break
 
-                title = track.title
-                artist = getattr(track.user, 'username', 'Unknown') if hasattr(track, 'user') and track.user else 'Unknown'
-                duration = track.duration  # Already in ms
-                url = track.permalink_url
-
-                # Get highest quality artwork/thumbnail
-                cover = ''
-                if hasattr(track, 'artwork_url') and track.artwork_url:
-                    # SoundCloud provides artwork_url, convert to high quality
-                    cover = track.artwork_url.replace('-large', '-t500x500')
-                elif hasattr(track, 'user') and track.user and hasattr(track.user, 'avatar_url') and track.user.avatar_url:
-                    # Fallback to user avatar
-                    cover = track.user.avatar_url.replace('-large', '-t500x500')
-
-                results.append({
-                    'id': str(track.id) + '_soundcloud',
-                    'title': title,
-                    'artist': artist,
-                    'duration': duration,
-                    'url': url,
-                    'cover': cover,
-                    'source': 'soundcloud'
-                })
+                # Same shape as related tracks: plays/likes/genre/upload date in 'metrics'.
+                results.append(related_tracks._soundcloud_result(track, count + 1))
                 count += 1
         except Exception as e:
             print(f"SoundCloud search error: {e}")
+
+        # Flag results that are already downloaded (same lookup as the related-tracks route).
+        urls = [r['url'] for r in results if r.get('url')]
+        library = {}
+        if urls:
+            conn = get_db_connection()
+            try:
+                rows = conn.execute(
+                    f"SELECT id, download_link FROM songs WHERE download_link IN ({','.join('?' * len(urls))})",
+                    urls
+                ).fetchall()
+                library = {row['download_link']: row['id'] for row in rows}
+            finally:
+                conn.close()
+        for r in results:
+            r['library_song_id'] = library.get(r.get('url'))
 
         return jsonify({'results': results})
 
@@ -2196,6 +2225,25 @@ def _song_row_to_client(item):
         'end_time': item['end_time'],
     }
 
+def _pending_queue_entry(link, data):
+    """Client shape of a pending queue row: a not-yet-downloaded track the
+    player skips over until it resolves. Its id is derived from the link so the
+    client can dedupe/remove it like any queued song."""
+    try:
+        meta = json.loads(data or '{}') or {}
+    except ValueError:
+        meta = {}
+    return {
+        'id': f'pending:{link}',
+        'pending': True,
+        'title': meta.get('title') or 'Unknown',
+        'artist': meta.get('artist') or 'Unknown',
+        'cover': meta.get('cover'),
+        'source': meta.get('source'),
+        'download_link': link,
+        'url': None,
+    }
+
 # Columns selected when joining a per-user playback table to `songs`.
 _SONG_SELECT = 's.id, s.title, s.artist, s.cover, s.source, s.download_link, s.file_path, s.start_time, s.end_time'
 
@@ -2229,6 +2277,15 @@ def save_queue():
             if not isinstance(song, dict) or 'id' not in song:
                 continue  # Skip invalid song objects
 
+            # Pending track (enqueued from search, still downloading): keep its
+            # link + display metadata until the download resolves it to a song.
+            if song.get('pending') and song.get('download_link'):
+                meta = {k: song.get(k) for k in ('title', 'artist', 'cover', 'source')}
+                cursor.execute('INSERT INTO queue (song_id, position, owner, pending_link, pending_data) '
+                               'VALUES (NULL, ?, ?, ?, ?)',
+                               (position, user, song['download_link'], json.dumps(meta)))
+                continue
+
             # Find song_id from songs table (assuming id is the database id)
             song_id = song.get('id')
             if song_id and isinstance(song_id, int):
@@ -2255,16 +2312,30 @@ def load_queue():
     conn = get_db_connection()
 
     try:
-        # Get queue with song details
+        # Get queue with song details. A pending row (no song_id) whose download
+        # has since landed resolves to that song by its link; one still
+        # downloading comes back as a pending placeholder.
         queue_items = conn.execute(f'''
-            SELECT q.position, {_SONG_SELECT}
+            SELECT q.position, q.pending_link, q.pending_data, {_SONG_SELECT}
             FROM queue q
-            JOIN songs s ON q.song_id = s.id
-            WHERE q.owner = ?
+            LEFT JOIN songs s ON s.id = COALESCE(q.song_id,
+                (SELECT id FROM songs WHERE download_link = q.pending_link ORDER BY id LIMIT 1))
+            WHERE q.owner = ? AND (s.id IS NOT NULL OR q.pending_link IS NOT NULL)
             ORDER BY q.position
         ''', (current_user(),)).fetchall()
 
-        queue = [_song_row_to_client(item) for item in queue_items]
+        queue, seen = [], set()
+        for item in queue_items:
+            if item['id'] is None:
+                entry = _pending_queue_entry(item['pending_link'], item['pending_data'])
+                # Not downloaded and no longer queued/downloading (it failed, or a
+                # restart dropped it) → it can never resolve, so leave it out.
+                if any(m.is_duplicate(entry['source'], entry['download_link'])
+                       for m in (manager, fallback_manager)):
+                    queue.append(entry)
+            elif item['id'] not in seen:
+                seen.add(item['id'])
+                queue.append(_song_row_to_client(item))
 
         return jsonify({'queue': queue})
 
