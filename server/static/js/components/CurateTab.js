@@ -165,6 +165,8 @@ class CurateTab extends HTMLElement {
       // Handle subtab switching
       const subtab = event.target.closest('.subtab');
       if (subtab) {
+        // Re-tapping the subtab you're already on does nothing.
+        if (subtab.dataset.subtab === this.activeSubtab) return;
         this.activeSubtab = subtab.dataset.subtab;
         this.render();
         return;
@@ -951,11 +953,19 @@ class CurateTab extends HTMLElement {
   }
 
   /**
-   * Return to the default view — the Tracks subtab with no search, so the
-   * evergreens show. Used when the tab button is re-tapped.
+   * Re-tap of the Curate tab button. Returns to the start of the Tracks subtab
+   * (scrolled to top, search cleared); if already there, moves on to Playlists.
    */
   showDefaultSubtab() {
-    if (this.activeSubtab === 'tracks' && !this.searchQueryRaw) return;
+    const scroller = this.shadowRoot.querySelector('.content-area');
+    const atStart = this.activeSubtab === 'tracks' && !this.searchQueryRaw &&
+                    (!scroller || scroller.scrollTop === 0);
+    if (atStart) {
+      this.activeSubtab = 'playlists';
+      this.render();
+      return;
+    }
+
     this.searchQueryRaw = '';
     this.searchQuery = '';
     const input = this.shadowRoot.querySelector('.search-input');
@@ -963,8 +973,14 @@ class CurateTab extends HTMLElement {
       input.value = '';
       input.blur();
     }
-    this.activeSubtab = 'tracks';
-    this.render();
+    if (this.activeSubtab === 'tracks') {
+      this.renderContent();
+    } else {
+      this.activeSubtab = 'tracks';
+      this.render();
+    }
+    const area = this.shadowRoot.querySelector('.content-area');
+    if (area) area.scrollTop = 0;
   }
 
   /**
