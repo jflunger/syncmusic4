@@ -19,6 +19,11 @@ export PYENV_ROOT="$HOME/.pyenv"
 eval "$(pyenv init -)"
 eval "$(pyenv virtualenv-init -)"
 
+# yt-dlp needs a JS runtime (deno) to solve YouTube's signature/"n" challenges;
+# without it downloads fail with "Signature solving failed". deno lives in
+# ~/.deno/bin, which the vibe/tmux environment does not put on PATH.
+[[ -d $HOME/.deno/bin ]] && export PATH="$HOME/.deno/bin:$PATH"
+
 # yt-dlp / votify are installed into the pyenv env; keep its bin on PATH so the
 # app's shell-outs find them.
 sleep 2
