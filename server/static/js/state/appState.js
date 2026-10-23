@@ -113,7 +113,13 @@ function initializeWebSocket() {
     });
 
     socket.on('song_redownloaded', (data) => {
-      // The audio file was replaced in place; refresh songs so the new file URL is used.
+      // The audio file was replaced in place; drop the device's stale copy (old and new name —
+      // the new name can be the old one) and refresh songs so the new file URL is used.
+      const old = appState.get('songs').find(s => s.id === data.song_id);
+      import('../services/AudioCache.js').then(({ default: audioCache }) => {
+        if (old?.url) audioCache.remove(old.url);
+        if (data.url) audioCache.remove(data.url);
+      });
       import('../services/api.js').then(({ fetchSongs }) => {
         fetchSongs().then(songs => {
           if (songs) appState.set('songs', songs);

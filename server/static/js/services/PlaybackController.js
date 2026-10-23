@@ -20,6 +20,10 @@
  * frame, and the OS scrubber gets the same numbers. Only the audio elements (and the
  * persisted resume point) deal in raw file time — see clipStart/clipEnd/publishPosition.
  *
+ * Library audio is served from the on-device AudioCache whenever it can be: the idle element is
+ * always filled from it (downloading the next track into the cache first), so gapless swaps and
+ * lock-screen skips need no network. See loadIdle / playFromCache.
+ *
  * Usage:
  *   import playback from './services/PlaybackController.js';
  *   playback.toggle();            // play/pause
@@ -41,6 +45,7 @@ import appState from '../state/appState.js';
 import queueManager from './QueueManager.js';
 import nextTrack from './NextTrack.js';
 import ownership from './PlayerOwnership.js';
+import audioCache from './AudioCache.js';
 import { savePlaybackState as apiSavePlaybackState, loadPlaybackState, logListen, fetchEvergreens } from './api.js';
 
 // A play counts as a "listen" (and is logged to the backend) once this much of the track has
@@ -69,6 +74,8 @@ class PlaybackController {
     this._previewActive = false;  // the preview, not the library track, owns the OS media controls
 
     this._preloadedSong = null;   // song whose url is currently loaded into preloadEl
+    this._preloadWanted = null;   // song the idle element is being filled with (may still be downloading)
+    this._blobUrls = new WeakMap(); // element -> blob: URL it holds, revoked when its src changes
     this._suppressPreload = false; // guard so a mid-swap re-resolve doesn't clobber the buffered track
     this._mediaHandlersSet = false; // OS media-session handlers registered once (see setupMediaSession)
     this._unlocked = new WeakSet(); // elements iOS has granted a gesture to (see armAudioUnlock)
@@ -82,6 +89,8 @@ class PlaybackController {
     this._listenSeconds = 0;
     this._listenLastTime = 0;
     this._listenLogged = false;
+
+    audioCache.init();   // loads the cache index synchronously enough for has() right away
 
     this.attachAudioListeners(this.audioElement);
     this.attachAudioListeners(this.preloadEl);
@@ -258,13 +267,52 @@ class PlaybackController {
       this.preloadEl = previous;
       this.preloadEl.pause();
       this.audioElement.volume = appState.get('volume');
-    } else {
-      this.audioElement.src = song.url;
     }
+    // Not swapping, but the track is on the device: play it from there. Only while the app is in
+    // the foreground — reading the cache is async, and play() may be deferred past a tap (the
+    // elements are unlocked and the gesture carries through a short await) but NOT past a
+    // lock-screen action (see the CRITICAL note in startElement). In the background we stream instead.
+    const fromCache = !swapped && document.visibilityState === 'visible' && audioCache.has(song.url);
+    if (!swapped && !fromCache) this.setSrc(this.audioElement, song.url);
     this._preloadedSong = null;
 
     appState.set('currentSong', song);
 
+    if (fromCache) {
+      this.audioElement.pause();   // silence the outgoing track while the cached file is read
+      this.playFromCache(song);
+    } else {
+      this.startElement(song, swapped);
+      // Streaming a track that isn't on the device yet: also keep a copy for next time.
+      if (!swapped) audioCache.store(song.url);
+    }
+    this.persist(true);
+    // Re-warm the idle element with whatever now plays next (the swap freed it).
+    this.preloadNext(nextTrack.peek());
+  }
+
+  /**
+   * Point the active element at the cached copy of `song` and start it. Falls back to streaming
+   * if the cache read fails. Dropped if another track was started in the meantime.
+   * @param {Object} song
+   */
+  async playFromCache(song) {
+    const el = this.audioElement;
+    const blobUrl = await audioCache.objectUrl(song.url);
+    if (el !== this.audioElement || appState.get('currentSong')?.id !== song.id) {
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+      return;
+    }
+    this.setSrc(el, blobUrl || song.url);
+    this.startElement(song, false);
+  }
+
+  /**
+   * Apply the custom start to the (already loaded) active element and play it.
+   * @param {Object} song
+   * @param {boolean} swapped - the element was swapped in from preloading (enables recovery)
+   */
+  startElement(song, swapped) {
     // Apply the custom start, then begin playback. CRITICAL: play() must be called synchronously
     // here. When this runs from an OS / lock-screen action handler (next/previous), the browser
     // grants only a transient user activation; deferring play() into an async callback (e.g.
@@ -301,9 +349,20 @@ class PlaybackController {
       });
     }
     // isPlaying follows from the element's 'play' event.
-    this.persist(true);
-    // Re-warm the idle element with whatever now plays next (the swap freed it).
-    this.preloadNext(nextTrack.peek());
+  }
+
+  /**
+   * Set an element's source, revoking the blob: URL it held before (if any) so cached files
+   * don't pile up in memory. Every src change on the two library elements goes through here.
+   * @param {HTMLAudioElement} el
+   * @param {string} src - a /audio/ URL or a blob: URL from AudioCache
+   */
+  setSrc(el, src) {
+    const old = this._blobUrls.get(el);
+    if (old && old !== src) URL.revokeObjectURL(old);
+    if (src.startsWith('blob:')) this._blobUrls.set(el, src);
+    else this._blobUrls.delete(el);
+    el.src = src;
   }
 
   /**
@@ -714,7 +773,7 @@ class PlaybackController {
     this.preloadEl = blockedEl;
     this.preloadEl.pause();
     this.audioElement.volume = appState.get('volume');
-    this.audioElement.src = song.url;
+    this.setSrc(this.audioElement, song.url);
     this._preloadedSong = null;
 
     const start = song.start_time ?? 0;
@@ -740,23 +799,48 @@ class PlaybackController {
   preloadNext(song) {
     if (!song || !song.url) {
       this._preloadedSong = null;
+      this._preloadWanted = null;
       return;
     }
     if (this._preloadedSong && this._preloadedSong.url === song.url) return;
+    if (this._preloadWanted && this._preloadWanted.url === song.url) return; // already filling
+    this._preloadedSong = null;
+    this._preloadWanted = song;
+    this.loadIdle(song);
+  }
+
+  /**
+   * Fill the idle element with `song` from the device cache, downloading it into the cache first
+   * if needed (one download serves both). Until the element holds it, `_preloadedSong` stays null
+   * so next() streams instead of swapping to an empty element. Falls back to streaming the URL
+   * when the cache is unavailable (no Cache Storage, quota, offline).
+   * @param {Object} song
+   */
+  async loadIdle(song) {
+    let src = await audioCache.objectUrl(song.url);
+    if (!src && this._preloadWanted === song && await audioCache.store(song.url)) {
+      src = await audioCache.objectUrl(song.url);
+    }
+    if (this._preloadWanted !== song) {   // superseded while we waited
+      if (src) URL.revokeObjectURL(src);
+      return;
+    }
+    this._preloadWanted = null;
     this._preloadedSong = song;
     // The two elements swap roles, so whichever one is idle right now may be the element that
     // started life as the active one — set preload on it every time rather than once in the
     // constructor. Without this, after the first swap the "preloader" only fetched metadata and
     // the next track had to be downloaded from scratch at the moment it was needed.
     this.preloadEl.preload = 'auto';
-    this.preloadEl.src = song.url;
+    this.setSrc(this.preloadEl, src || song.url);
     this.preloadEl.load();
     // Pre-seek to the custom start so the swap begins exactly there with that region buffered.
     const start = song.start_time ?? 0;
     if (start > 0) {
-      const seek = () => { this.preloadEl.currentTime = start; };
-      if (this.preloadEl.readyState >= 1) seek();
-      else this.preloadEl.addEventListener('loadedmetadata', seek, { once: true });
+      const el = this.preloadEl;
+      const seek = () => { el.currentTime = start; };
+      if (el.readyState >= 1) seek();
+      else el.addEventListener('loadedmetadata', seek, { once: true });
     }
   }
 
@@ -788,7 +872,12 @@ class PlaybackController {
     const { song, position } = this.pickResumePoint(saved);
     if (!song || !song.url) return;
 
-    this.audioElement.src = song.url;
+    const cached = await audioCache.objectUrl(song.url);
+    if (appState.get('currentSong')) {   // the user started something while we read the cache
+      if (cached) URL.revokeObjectURL(cached);
+      return;
+    }
+    this.setSrc(this.audioElement, cached || song.url);
     appState.set('currentSong', song);
 
     // The saved position is raw file time. One outside the clip (the track was re-trimmed

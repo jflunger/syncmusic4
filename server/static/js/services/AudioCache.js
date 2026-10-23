@@ -10,8 +10,8 @@
  * Audio URLs are immutable per file name, except a re-download can rewrite the same name — the
  * `song_redownloaded` socket event calls remove() for that.
  *
- * Space: ~5MB per track at 192kbps. Usage is capped at MAX_BYTES and at a share of the origin's
- * quota; the least recently played files are dropped first.
+ * Space: ~4.5MB per track (library average), so MAX_BYTES holds ~1100 tracks. Usage is also capped
+ * at a share of the origin's quota; the least recently played files are dropped first.
  *
  * Usage:
  *   import audioCache from './services/AudioCache.js';
@@ -23,7 +23,7 @@
 
 const CACHE = 'syncmusic-audio-v1';
 const META_KEY = 'audioCacheMeta';          // localStorage: { [url]: { size, used } }
-const MAX_BYTES = 4 * 1024 ** 3;            // hard cap regardless of quota
+const MAX_BYTES = 5 * 1024 ** 3;            // hard cap regardless of quota
 const QUOTA_SHARE = 0.8;                    // never fill more than this share of the quota
 
 class AudioCache {
@@ -119,11 +119,14 @@ class AudioCache {
     try {
       const res = await fetch(url, { credentials: 'same-origin' });
       if (!res.ok || res.status !== 200) return false;
-      const size = Number(res.headers.get('Content-Length')) || 0;
+      // Read the whole body first: the real byte count keeps the LRU accounting honest even when
+      // a proxy drops Content-Length, and a cut-off download never lands in the cache.
+      const blob = await res.blob();
+      const size = blob.size;
       await this._makeRoom(size);
       const cache = await caches.open(CACHE);
       try {
-        await cache.put(url, res);
+        await cache.put(url, new Response(blob, { headers: { 'Content-Type': blob.type || 'audio/mpeg' } }));
       } catch (err) {
         // iOS rejects put() on a full origin instead of evicting: drop the oldest and give up on
         // this one rather than looping.

@@ -6,7 +6,7 @@
 // asset. The fetch handler is cache-first, so clients keep serving the old copy until
 // CACHE_NAME changes — forgetting this is how the iOS PWA fullscreen fix keeps "regressing"
 // even when the source files are correct. See docs/ios-pwa-fullscreen.md.
-const CACHE_NAME = 'syncmusic-v71';
+const CACHE_NAME = 'syncmusic-v72';
 const CACHE_FILES = [
   '/',
   '/index.html',
@@ -63,7 +63,8 @@ self.addEventListener('activate', event => {
 // we don't even call respondWith.
 //
 // /audio/ is the important one: those are ranged media requests driving <audio>. Proxying them
-// through the worker gains nothing (they're never cached) and costs a lot — the worker has to be
+// through the worker gains nothing (offline audio is handled page-side by AudioCache.js, which
+// hands <audio> blob: URLs) and costs a lot — the worker has to be
 // woken for every range the player asks for, and on iOS a backgrounded page's worker may not be
 // spun up in time, so the track that was supposed to start next simply never loads. Media goes
 // straight to the network.
