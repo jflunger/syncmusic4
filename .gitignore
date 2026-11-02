@@ -26,3 +26,7 @@ server/static/audio/
 server/static/uploads/
 server/downloads/
 *.db
+users.json
+spotify_credentials.json
+# Third-party demo with no license; not used by the app.
+server/static/liquid_glass_demo/

@@ -22,13 +22,20 @@ app = Flask(__name__)
 CORS(app, supports_credentials=True)
 
 # --- Authentication -------------------------------------------------------
-# Fixed accounts (registration is closed). Plaintext is acceptable here: a
-# self-hosted app with three known users, not a public service.
-USERS = {
-    'pubert': '***REMOVED***',
-    'user2': 'passwordx',
-    'user3': 'passwordx',
-}
+# Fixed accounts (registration is closed), read from the gitignored
+# users.json in the repo root: {"username": "password", ...}. See
+# users.example.json. Plaintext is acceptable here: a self-hosted app with a
+# few known users, not a public service.
+def _load_users():
+    """Load the username -> password map; empty (nobody can log in) if missing."""
+    path = os.path.join(os.path.dirname(__file__), '..', 'users.json')
+    if not os.path.exists(path):
+        print(f"[Auth] WARNING: {os.path.abspath(path)} not found; no one can log in")
+        return {}
+    with open(path, 'r') as f:
+        return json.load(f)
+
+USERS = _load_users()
 
 def _load_secret_key():
     """Load a stable signing key so sessions survive restarts/deploys."""

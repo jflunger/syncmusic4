@@ -3,12 +3,19 @@ Spotify search module using spotipy library.
 Uses Client Credentials flow for authentication.
 """
 
+import json
+import os
+
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 
-# Hardcoded Spotify App credentials (replace with your actual values)
-CLIENT_ID = "***REMOVED***"
-CLIENT_SECRET = "***REMOVED***"
+# Spotify App credentials live in the gitignored spotify_credentials.json in
+# the repo root (see spotify_credentials.example.json).
+_CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), '..', 'spotify_credentials.json')
+with open(_CREDENTIALS_PATH, 'r') as _f:
+    _credentials = json.load(_f)
+CLIENT_ID = _credentials['client_id']
+CLIENT_SECRET = _credentials['client_secret']
 
 # Global spotipy client instance
 _spotify_client = None

@@ -6,7 +6,7 @@ import subprocess
 import json
 
 def test_playlist():
-    test_url = "https://soundcloud.com/<user>/sets/storage/<playlist>?si=***REMOVED***&utm_source=clipboard&utm_medium=text&utm_campaign=social_sharing"
+    test_url = "https://soundcloud.com/<user>/sets/<playlist>"
 
     print(f"Testing playlist feature with URL: {test_url}")
 
